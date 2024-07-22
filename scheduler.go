@@ -132,7 +132,7 @@ type SchedulerConfig struct {
 	TablePrefix                          string
 	ShutdownTimeout                      time.Duration
 	FailedAndCompletedOneTimeJobInterval time.Duration
-	Clock                                clockwork.Clock
+	clock                                clockwork.Clock
 }
 
 type Scheduler struct {
@@ -188,8 +188,8 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		config.Logger = slog.Default()
 	}
 
-	if config.Clock == nil {
-		config.Clock = clockwork.NewRealClock()
+	if config.clock == nil {
+		config.clock = clockwork.NewRealClock()
 	}
 
 	if config.JobCheckInterval == 0 {
@@ -232,7 +232,7 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		cancel:       cancel,
 		tableName:    config.TablePrefix + "scheduled_jobs",
 		runningJobs:  sync.Map{},
-		clock:        config.Clock,
+		clock:        config.clock,
 	}, nil
 }
 

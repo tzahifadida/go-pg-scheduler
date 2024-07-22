@@ -111,7 +111,7 @@ func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
 		ShutdownTimeout:                      5 * time.Second,
 		Logger:                               testLogger,
 		FailedAndCompletedOneTimeJobInterval: time.Hour,
-		Clock:                                fakeClock,
+		clock:                                fakeClock,
 		Ctx:                                  ctx,
 	}
 

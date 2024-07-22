@@ -40,7 +40,6 @@ type SchedulerConfig struct {
     TablePrefix                          string
     ShutdownTimeout                      time.Duration
     FailedAndCompletedOneTimeJobInterval time.Duration
-    Clock                                clockwork.Clock
 }
 ```
 
@@ -58,7 +57,6 @@ type SchedulerConfig struct {
 - `TablePrefix`: A prefix for the database table name.
 - `ShutdownTimeout`: The maximum duration to wait for jobs to complete during shutdown.
 - `FailedAndCompletedOneTimeJobInterval`: How often to clean up failed and completed one-time jobs.
-- `Clock`: A `clockwork.Clock` instance for time-related operations (useful for testing).
 
 ## Usage
 
