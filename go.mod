@@ -1,4 +1,4 @@
-module go-pg-scheduler
+module github.com/tzahifadida/go-pg-scheduler
 
 go 1.22
 

@@ -17,7 +17,7 @@ PGScheduler is a robust and flexible job scheduling library for Go applications 
 To install PGScheduler, use `go get`:
 
 ```bash
-go get github.com/tzahifadida/pgscheduler
+go get github.com/tzahifadida/go-pg-scheduler
 ```
 
 ## Configuration
@@ -69,7 +69,7 @@ type SchedulerConfig struct {
 ```go
 import (
     "database/sql"
-    "github.com/tzahifadida/pgscheduler"
+    "github.com/tzahifadida/go-pg-scheduler"
     _ "github.com/lib/pq"
 )
 
@@ -215,7 +215,7 @@ This feature is particularly useful in distributed environments where you have m
 ```go
 import (
     "database/sql"
-    "github.com/tzahifadida/pgscheduler"
+    "github.com/tzahifadida/go-pg-scheduler"
     _ "github.com/lib/pq"
 )
 
@@ -246,7 +246,7 @@ func main() {
 ```go
 import (
     "github.com/jackc/pgx/v4/stdlib"
-    "github.com/tzahifadida/pgscheduler"
+    "github.com/tzahifadida/go-pg-scheduler"
 )
 
 func main() {
