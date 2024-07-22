@@ -118,7 +118,9 @@ func getJobKey(j Job) (string, error) {
 }
 
 type Logger interface {
+	Debug(msg string, args ...any)
 	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
 	Error(msg string, args ...any)
 }
 
@@ -436,7 +438,7 @@ func (s *Scheduler) cleanOrphanedJobs() error {
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		s.config.Logger.Error("failed to get rows affected", "error", err)
-	} else {
+	} else if rowsAffected > 0 {
 		s.config.Logger.Info("cleaned orphaned jobs", "count", rowsAffected)
 	}
 
@@ -556,7 +558,7 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 	defer s.runningJobs.Delete(jobKey)
 
 	startTime := s.clock.Now().UTC()
-	s.config.Logger.Info("running job", "job", jobKey, "time", startTime)
+	s.config.Logger.Debug("running job", "job", jobKey, "time", startTime)
 	ctx := s.ctx
 
 	err := job.Init(ctx)
@@ -576,7 +578,7 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 		var params interface{}
 		err = json.Unmarshal(parameters, &params)
 		if err != nil {
-			s.config.Logger.Error("error unmarshaling job parameters", "job", jobKey, "error", err)
+			s.config.Logger.Error("error unmarshalling job parameters", "job", jobKey, "error", err)
 			s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
 			return
 		}
@@ -688,7 +690,7 @@ func (s *Scheduler) checkAndResetTimedOutJobs() error {
 	}
 
 	for _, job := range resetJobs {
-		s.config.Logger.Info("reset timed-out job", "job", job.Name, "key", job.Key, "type", job.JobType, "retries_left", job.Retries)
+		s.config.Logger.Debug("reset timed-out job", "job", job.Name, "key", job.Key, "type", job.JobType, "retries_left", job.Retries)
 		if job.JobType == JobTypeOneTime && job.Retries <= 0 {
 			if err := s.removeJob(job.Key); err != nil {
 				s.config.Logger.Error("failed to remove exhausted one-time job", "job", job.Name, "key", job.Key, "error", err)
