@@ -122,7 +122,6 @@ type SchedulerConfig struct {
 	DB                                   *sql.DB
 	DBDriverName                         string
 	MaxConcurrentJobs                    int
-	JobRetentionDays                     int
 	JobCheckInterval                     time.Duration
 	OrphanedJobTimeout                   time.Duration
 	HeartbeatInterval                    time.Duration
@@ -198,7 +197,7 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	}
 
 	if config.OrphanedJobTimeout == 0 {
-		config.OrphanedJobTimeout = 14 * 24 * time.Hour // 14 days default
+		config.OrphanedJobTimeout = 14 * 24 * time.Hour
 	}
 
 	if config.HeartbeatInterval == 0 {

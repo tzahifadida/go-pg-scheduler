@@ -102,7 +102,7 @@ func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
 		DB:                                   testDBSQL,
 		DBDriverName:                         "postgres",
 		MaxConcurrentJobs:                    5,
-		JobRetentionDays:                     14,
+		OrphanedJobTimeout:                   14 * 24 * time.Hour,
 		JobCheckInterval:                     time.Second,
 		HeartbeatInterval:                    time.Second,
 		NoHeartbeatTimeout:                   3 * time.Second,

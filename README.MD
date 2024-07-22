@@ -30,7 +30,6 @@ type SchedulerConfig struct {
     DB                                   *sql.DB
     DBDriverName                         string
     MaxConcurrentJobs                    int
-    JobRetentionDays                     int
     JobCheckInterval                     time.Duration
     OrphanedJobTimeout                   time.Duration
     HeartbeatInterval                    time.Duration
@@ -49,9 +48,8 @@ type SchedulerConfig struct {
 - `DB`: A `*sql.DB` instance for database operations.
 - `DBDriverName`: The name of the database driver ("postgres" for `lib/pq`, "pgx" for `jackc/pgx`).
 - `MaxConcurrentJobs`: The maximum number of jobs that can run concurrently.
-- `JobRetentionDays`: The number of days to retain job history.
 - `JobCheckInterval`: How often to check for new jobs to run.
-- `OrphanedJobTimeout`: The duration after which a job is considered orphaned.
+- `OrphanedJobTimeout`: The duration after which a job is considered orphaned (default: 14 days).
 - `HeartbeatInterval`: How often to update the heartbeat for running jobs.
 - `NoHeartbeatTimeout`: The duration after which a job with no heartbeat is considered failed.
 - `CreateSchema`: Whether to automatically create the required database schema.
