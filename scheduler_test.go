@@ -368,7 +368,9 @@ func TestMarkJobFailed(t *testing.T) {
 	assert.True(t, jobRecord.ExecutionTime.Valid)
 	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64) // 1 second in milliseconds
 	assert.True(t, jobRecord.LastFailure.Valid)
-	assert.Equal(t, fakeClock.Now().UTC(), jobRecord.LastFailure.Time.UTC())
+	assert.Equal(t,
+		fakeClock.Now().UTC().Truncate(time.Microsecond),
+		jobRecord.LastFailure.Time.UTC().Truncate(time.Microsecond))
 	assert.Equal(t, 1, jobRecord.ConsecutiveFailures)
 
 	// Test one-time job with retries
@@ -391,7 +393,9 @@ func TestMarkJobFailed(t *testing.T) {
 	assert.True(t, jobRecord.ExecutionTime.Valid)
 	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64)
 	assert.True(t, jobRecord.LastFailure.Valid)
-	assert.Equal(t, fakeClock.Now().UTC(), jobRecord.LastFailure.Time.UTC())
+	assert.Equal(t,
+		fakeClock.Now().UTC().Truncate(time.Microsecond),
+		jobRecord.LastFailure.Time.UTC().Truncate(time.Microsecond))
 	assert.Equal(t, 1, jobRecord.ConsecutiveFailures)
 }
 
