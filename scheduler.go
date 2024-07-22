@@ -117,6 +117,11 @@ func getJobKey(j Job) (string, error) {
 	return j.Name(), nil
 }
 
+type Logger interface {
+	Info(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 type SchedulerConfig struct {
 	Ctx                                  context.Context
 	DB                                   *sql.DB
@@ -127,7 +132,7 @@ type SchedulerConfig struct {
 	HeartbeatInterval                    time.Duration
 	NoHeartbeatTimeout                   time.Duration
 	CreateSchema                         bool
-	Logger                               *slog.Logger
+	Logger                               Logger
 	RunImmediately                       bool
 	TablePrefix                          string
 	ShutdownTimeout                      time.Duration
