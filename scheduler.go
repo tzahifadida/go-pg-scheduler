@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -38,10 +39,8 @@ const (
 	statusFailed    status = "failed"
 )
 
-type JobLifecycleI interface {
-	Init(ctx context.Context) error
+type JobRunnerI interface {
 	Run(ctx context.Context) error
-	Shutdown(ctx context.Context) error
 }
 
 type JobConfigI interface {
@@ -54,7 +53,7 @@ type JobConfigI interface {
 
 type Job interface {
 	JobConfigI
-	JobLifecycleI
+	JobRunnerI
 }
 
 type JobConfig struct {
@@ -128,7 +127,8 @@ type SchedulerConfig struct {
 	Ctx                                  context.Context
 	DB                                   *sql.DB
 	DBDriverName                         string
-	MaxConcurrentJobs                    int
+	MaxConcurrentOneTimeJobs             int
+	MaxConcurrentRecurringJobs           int
 	JobCheckInterval                     time.Duration
 	OrphanedJobTimeout                   time.Duration
 	HeartbeatInterval                    time.Duration
@@ -176,10 +176,12 @@ type jobRecord struct {
 }
 
 func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
-	jobTypeCount := int(jobTypeLast)
+	if config.MaxConcurrentRecurringJobs < 0 {
+		return nil, fmt.Errorf("MaxConcurrentRecurringJobs must be at least 1")
+	}
 
-	if config.MaxConcurrentJobs < jobTypeCount {
-		return nil, fmt.Errorf("MaxConcurrentJobs must be at least %d (number of job types)", jobTypeCount)
+	if config.MaxConcurrentOneTimeJobs < 0 {
+		return nil, fmt.Errorf("MaxConcurrentOneTimeJobs must be at least 1")
 	}
 
 	if config.DB == nil {
@@ -192,6 +194,13 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 
 	// Wrap the *sql.DB with sqlx
 	sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
+
+	if config.MaxConcurrentOneTimeJobs == 0 {
+		config.MaxConcurrentOneTimeJobs = 1
+	}
+	if config.MaxConcurrentRecurringJobs == 0 {
+		config.MaxConcurrentRecurringJobs = 1
+	}
 
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -519,11 +528,31 @@ func (s *Scheduler) cleanFailedAndCompletedOneTimeJobs() error {
 }
 
 func (s *Scheduler) processJobs() error {
-	quotaPerType := s.config.MaxConcurrentJobs / int(jobTypeLast)
-	for jobType := JobType(0); jobType < jobTypeLast; jobType++ {
-		if err := s.acquireLockAndRun(jobType, quotaPerType); err != nil {
-			return fmt.Errorf("error acquiring lock and running jobs of type %d: %w", jobType, err)
+	var wg sync.WaitGroup
+	var errRecurring error
+	var errOneTime error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.acquireLockAndRun(JobTypeRecurring, s.config.MaxConcurrentRecurringJobs); err != nil {
+			errRecurring = fmt.Errorf("error acquiring lock and running jobs of type %d: %w", JobTypeRecurring, err)
 		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.acquireLockAndRun(JobTypeOneTime, s.config.MaxConcurrentOneTimeJobs); err != nil {
+			errOneTime = fmt.Errorf("error acquiring lock and running jobs of type %d: %w", JobTypeOneTime, err)
+		}
+	}()
+	wg.Wait()
+	if errRecurring != nil && errOneTime == nil {
+		return errRecurring
+	} else if errRecurring == nil && errOneTime != nil {
+		return errOneTime
+	} else if errRecurring != nil && errOneTime != nil {
+		return errors.Join(errRecurring, errOneTime)
 	}
 	return nil
 }
@@ -602,19 +631,13 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 	s.config.Logger.Debug("running job", "job", jobKey, "time", startTime)
 	ctx := s.ctx
 
-	err := job.Init(ctx)
-	if err != nil {
-		s.config.Logger.Error("error initializing job", "job", jobKey, "error", err)
-		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
-		return
-	}
-
 	stopHeartbeat := make(chan struct{})
 	s.wg.Add(1)
 	defer close(stopHeartbeat)
 	defer s.wg.Done()
 	go s.updateHeartbeat(jobKey, stopHeartbeat)
 
+	var err error
 	if job.JobType() == JobTypeOneTime {
 		var params interface{}
 		err = json.Unmarshal(parameters, &params)
@@ -629,13 +652,6 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 	err = job.Run(ctx)
 	if err != nil {
 		s.config.Logger.Error("error running job", "job", jobKey, "error", err)
-		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
-		return
-	}
-
-	err = job.Shutdown(ctx)
-	if err != nil {
-		s.config.Logger.Error("error shutting down job", "job", jobKey, "error", err)
 		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
 		return
 	}

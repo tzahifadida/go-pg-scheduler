@@ -101,7 +101,8 @@ func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
 	config := SchedulerConfig{
 		DB:                                   testDBSQL,
 		DBDriverName:                         "postgres",
-		MaxConcurrentJobs:                    5,
+		MaxConcurrentOneTimeJobs:             5,
+		MaxConcurrentRecurringJobs:           5,
 		OrphanedJobTimeout:                   14 * 24 * time.Hour,
 		JobCheckInterval:                     time.Second,
 		HeartbeatInterval:                    time.Second,

@@ -12,6 +12,12 @@ PGScheduler is a robust and flexible distributed job scheduling library for Go a
 - Configurable node job concurrency limits
 - Support for both `lib/pq` and `jackc/pgx` or any other database/sql based drivers
 
+### Distributed Execution
+
+PGScheduler ensures that only one instance of a job runs at a time across distributed nodes. This is achieved through a locking mechanism in the database. When a node picks up a job to run, it sets a lock in the database. Other nodes will see this lock and skip the job, preventing multiple executions of the same job across different nodes.
+
+This feature is particularly useful in distributed environments where you have multiple instances of your application running, each with its own scheduler. It prevents job duplication and ensures consistent execution of recurring tasks.
+
 ## Installation
 
 To install PGScheduler, use `go get`:
@@ -205,12 +211,6 @@ if err != nil {
 }
 ```
 
-### Distributed Execution of Recurring Jobs
-
-PGScheduler ensures that only one instance of a recurring job runs at a time across distributed nodes. This is achieved through a locking mechanism in the database. When a node picks up a job to run, it sets a lock in the database. Other nodes will see this lock and skip the job, preventing multiple executions of the same job across different nodes.
-
-This feature is particularly useful in distributed environments where you have multiple instances of your application running, each with its own scheduler. It prevents job duplication and ensures consistent execution of recurring tasks.
-
 ## Database Driver Examples
 
 ### Using `lib/pq`
@@ -279,6 +279,7 @@ func main() {
 ## Best Practices
 
 1. Always call `scheduler.Shutdown()` when your application is terminating to ensure proper cleanup.
+2. Don't create a job Name for jobs with slightly different behavior. For one time jobs you can use parameters passing instead. Excessive job "Name"s will damage performance since each job code is kept in memory with Name as key and queries use a filter such as "IN (Names...)".
 2. Use appropriate retry counts for one-time jobs to handle transient failures.
 3. Implement proper error handling in your job's `Run` method.
 4. Use the context passed to the `Run` method for cancellation and timeout handling.
