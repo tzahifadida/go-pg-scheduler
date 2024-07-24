@@ -334,8 +334,8 @@ func (s *Scheduler) Shutdown() {
 }
 
 func (s *Scheduler) ScheduleJob(job Job) error {
-	if !s.started {
-		return fmt.Errorf("scheduler was not started")
+	if !s.initialized {
+		return fmt.Errorf("scheduler was not initialized")
 	}
 	key, err := getJobKey(job)
 	if err != nil {
