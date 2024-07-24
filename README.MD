@@ -125,9 +125,7 @@ type Job interface {
     JobType() JobType
     Parameters() interface{}
     Retries() int
-    Init(ctx context.Context) error
     Run(ctx context.Context) error
-    Shutdown(ctx context.Context) error
 }
 ```
 
@@ -138,18 +136,8 @@ type MyRecurringJob struct {
     pgscheduler.JobConfig
 }
 
-func (j *MyRecurringJob) Init(ctx context.Context) error {
-    // Initialization logic
-    return nil
-}
-
 func (j *MyRecurringJob) Run(ctx context.Context) error {
     // Job logic
-    return nil
-}
-
-func (j *MyRecurringJob) Shutdown(ctx context.Context) error {
-    // Cleanup logic
     return nil
 }
 
@@ -173,11 +161,6 @@ type MyOneTimeJob struct {
     pgscheduler.JobConfig
 }
 
-func (j *MyOneTimeJob) Init(ctx context.Context) error {
-    // Initialization logic
-    return nil
-}
-
 func (j *MyOneTimeJob) Run(ctx context.Context) error {
     // Retrieve parameters from context
     params := ctx.Value(pgscheduler.ClusterSchedulerParametersKey)
@@ -186,11 +169,6 @@ func (j *MyOneTimeJob) Run(ctx context.Context) error {
         fmt.Printf("Job parameters: %v\n", params)
     }
     // Job logic
-    return nil
-}
-
-func (j *MyOneTimeJob) Shutdown(ctx context.Context) error {
-    // Cleanup logic
     return nil
 }
 
