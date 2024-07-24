@@ -614,21 +614,22 @@ func (s *Scheduler) acquireLockAndRun(jobType JobType, quota int) error {
 	return nil
 }
 
-func (s *Scheduler) recoverAndLog(msg string) {
+func (s *Scheduler) recoverLogAndFail(msg string, jobKey string, job Job, retries int, startTime time.Time) {
 	if p := recover(); p != nil {
 		if err, ok := p.(error); ok {
 			s.config.Logger.Error(msg+": %w, stack: %s", err, string(debug.Stack()))
 			return
 		}
 		s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
+		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
 	}
 }
 
 func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, retries int) {
 	defer s.runningJobs.Delete(jobKey)
-	defer s.recoverAndLog(fmt.Sprintf("failed to run job - %s", jobKey))
-
 	startTime := s.clock.Now().UTC()
+	defer s.recoverLogAndFail(fmt.Sprintf("failed to run job - %s", jobKey), jobKey, job, retries, startTime)
+
 	s.config.Logger.Debug("running job", "job", jobKey, "time", startTime)
 	ctx := s.ctx
 
