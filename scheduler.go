@@ -196,10 +196,10 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
 
 	if config.MaxConcurrentOneTimeJobs == 0 {
-		config.MaxConcurrentOneTimeJobs = 1
+		config.MaxConcurrentOneTimeJobs = 2
 	}
 	if config.MaxConcurrentRecurringJobs == 0 {
-		config.MaxConcurrentRecurringJobs = 1
+		config.MaxConcurrentRecurringJobs = 2
 	}
 
 	if config.Logger == nil {
