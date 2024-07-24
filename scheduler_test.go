@@ -363,7 +363,7 @@ func TestMarkJobFailed(t *testing.T) {
 	err = testDB.Get(&jobRecord, query, recurringJob.Name())
 	require.NoError(t, err)
 
-	scheduler.markJobFailed(jobRecord.Key, JobTypeRecurring, 0, time.Second)
+	scheduler.markJobFailed(jobRecord.Key, recurringJob, 0, time.Second)
 
 	err = testDB.Get(&jobRecord, query, recurringJob.Name())
 	assert.NoError(t, err)
@@ -387,7 +387,7 @@ func TestMarkJobFailed(t *testing.T) {
 	err = testDB.Get(&jobRecord, query, oneTimeJob.Name())
 	require.NoError(t, err)
 
-	scheduler.markJobFailed(jobRecord.Key, JobTypeOneTime, jobRecord.Retries, time.Second)
+	scheduler.markJobFailed(jobRecord.Key, oneTimeJob, jobRecord.Retries, time.Second)
 
 	err = testDB.Get(&jobRecord, query, oneTimeJob.Name())
 	assert.NoError(t, err)

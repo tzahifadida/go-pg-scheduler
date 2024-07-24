@@ -621,7 +621,7 @@ func (s *Scheduler) recoverLogAndFail(msg string, jobKey string, job Job, retrie
 		} else {
 			s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
 		}
-		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
+		s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
 	}
 }
 
@@ -645,7 +645,7 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 		err = json.Unmarshal(parameters, &params)
 		if err != nil {
 			s.config.Logger.Error("error unmarshalling job parameters", "job", jobKey, "error", err)
-			s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
+			s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
 			return
 		}
 		ctx = context.WithValue(s.ctx, ClusterSchedulerParametersKey, params)
@@ -654,15 +654,15 @@ func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, r
 	err = job.Run(ctx)
 	if err != nil {
 		s.config.Logger.Error("error running job", "job", jobKey, "error", err)
-		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
+		s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
 		return
 	}
 
 	s.markJobSucceeded(jobKey, job, s.clock.Now().UTC().Sub(startTime))
 }
 
-func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, executionTime time.Duration) {
-	if jobType == JobTypeOneTime && retries > 0 {
+func (s *Scheduler) markJobFailed(jobKey string, job Job, retries int, executionTime time.Duration) {
+	if job.JobType() == JobTypeOneTime && retries > 0 {
 		nextRun := s.clock.Now().UTC().Add(s.config.JobCheckInterval)
 		query := fmt.Sprintf(`
 			UPDATE %s 
@@ -674,7 +674,7 @@ func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, e
 		if err != nil {
 			s.config.Logger.Error("failed to mark one-time job for retry", "job", jobKey, "error", err)
 		}
-	} else if jobType == JobTypeOneTime {
+	} else if job.JobType() == JobTypeOneTime {
 		// For one-time jobs with no retries left, set next_run to max time
 		maxTime := time.Unix(1<<63-62135596801, 999999999)
 		query := fmt.Sprintf(`
@@ -687,12 +687,17 @@ func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, e
 			s.config.Logger.Error("failed to mark one-time job as failed", "job", jobKey, "error", err)
 		}
 	} else {
+		nextRun, err := s.calculateNextRun(job.CronSchedule())
+		if err != nil {
+			s.config.Logger.Error("failed to calculate next run", "job", jobKey, "error", err)
+			return
+		}
 		query := fmt.Sprintf(`
 			UPDATE %s 
-			SET "picked" = false, "status" = $1, "execution_time" = $2, 
-				"last_failure" = $3, "consecutive_failures" = "consecutive_failures" + 1
-			WHERE "key" = $4`, s.tableName)
-		_, err := s.config.DB.Exec(query, statusFailed, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
+			SET "picked" = false, "picked_by" = $1, "next_run" = $2, "status" = $3, "execution_time" = $4, 
+				"last_failure" = $5, "consecutive_failures" = "consecutive_failures" + 1
+			WHERE "key" = $6`, s.tableName)
+		_, err = s.config.DB.Exec(query, uuid.Nil, nextRun, statusFailed, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
 		if err != nil {
 			s.config.Logger.Error("failed to mark job as failed", "job", jobKey, "error", err)
 		}
