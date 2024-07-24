@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -616,10 +617,10 @@ func (s *Scheduler) acquireLockAndRun(jobType JobType, quota int) error {
 func (s *Scheduler) recoverAndLog(msg string) {
 	if p := recover(); p != nil {
 		if err, ok := p.(error); ok {
-			s.config.Logger.Error(msg+": %w", err)
+			s.config.Logger.Error(msg+": %w, stack: %s", err, string(debug.Stack()))
 			return
 		}
-		s.config.Logger.Error(msg+": %v", p)
+		s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -93,8 +92,7 @@ func TestMain(m *testing.M) {
 }
 
 func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
-	logBuffer := &strings.Builder{}
-	testLogger := slog.New(slog.NewTextHandler(logBuffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	testLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	fakeClock := clockwork.NewFakeClock()
 	ctx := context.WithValue(context.Background(), "clockwork", fakeClock)
