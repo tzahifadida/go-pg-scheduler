@@ -106,6 +106,7 @@ func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
 		JobCheckInterval:                     time.Second,
 		HeartbeatInterval:                    time.Second,
 		NoHeartbeatTimeout:                   3 * time.Second,
+		RunImmediately:                       true,
 		CreateSchema:                         true,
 		TablePrefix:                          "test_",
 		ShutdownTimeout:                      5 * time.Second,
@@ -121,6 +122,9 @@ func setupTestScheduler(t *testing.T) (*Scheduler, clockwork.FakeClock) {
 	testDB = scheduler.db
 
 	err = scheduler.Init()
+	require.NoError(t, err)
+
+	scheduler.Start()
 	require.NoError(t, err)
 
 	return scheduler, fakeClock
@@ -221,7 +225,7 @@ func TestCheckAndResetTimedOutJobs(t *testing.T) {
 		INSERT INTO %s ("key", "name", "picked", "picked_by", "heartbeat", "job_type", "retries", "status", "next_run")
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		scheduler.tableName)
-	_, err := testDB.Exec(query, "test_job_key", "test_job", true, scheduler.nodeID, fakeClock.Now().UTC().Add(-5*time.Minute), JobTypeOneTime, 2, StatusRunning, fakeClock.Now().UTC())
+	_, err := testDB.Exec(query, "test_job_key", "test_job", true, scheduler.nodeID, fakeClock.Now().UTC().Add(-5*time.Minute), JobTypeOneTime, 2, statusRunning, fakeClock.Now().UTC())
 	require.NoError(t, err)
 
 	// Advance clock to trigger timeout
@@ -236,7 +240,7 @@ func TestCheckAndResetTimedOutJobs(t *testing.T) {
 	err = testDB.Get(&job, query, "test_job_key")
 	assert.NoError(t, err)
 	assert.False(t, job.Picked)
-	assert.Equal(t, StatusPending, job.Status)
+	assert.Equal(t, statusPending, job.Status)
 	assert.Equal(t, 1, job.Retries)
 }
 
@@ -335,7 +339,7 @@ func TestRunJob(t *testing.T) {
 	// Verify job status after run
 	err = testDB.Get(&jobRecord, query, job.Name())
 	assert.NoError(t, err)
-	assert.Equal(t, StatusPending, jobRecord.Status)
+	assert.Equal(t, statusPending, jobRecord.Status)
 	assert.False(t, jobRecord.Picked)
 	assert.True(t, jobRecord.NextRun.After(fakeClock.Now().UTC()))
 	assert.True(t, jobRecord.ExecutionTime.Valid)
@@ -364,7 +368,7 @@ func TestMarkJobFailed(t *testing.T) {
 
 	err = testDB.Get(&jobRecord, query, recurringJob.Name())
 	assert.NoError(t, err)
-	assert.Equal(t, StatusFailed, jobRecord.Status)
+	assert.Equal(t, statusFailed, jobRecord.Status)
 	assert.True(t, jobRecord.ExecutionTime.Valid)
 	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64) // 1 second in milliseconds
 	assert.True(t, jobRecord.LastFailure.Valid)
@@ -388,7 +392,7 @@ func TestMarkJobFailed(t *testing.T) {
 
 	err = testDB.Get(&jobRecord, query, oneTimeJob.Name())
 	assert.NoError(t, err)
-	assert.Equal(t, StatusPending, jobRecord.Status)
+	assert.Equal(t, statusPending, jobRecord.Status)
 	assert.Equal(t, 1, jobRecord.Retries)
 	assert.True(t, jobRecord.ExecutionTime.Valid)
 	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64)
@@ -498,7 +502,7 @@ func TestFailedOneTimeJobCleaner(t *testing.T) {
 
 	// Mark the job as failed
 	query := fmt.Sprintf(`UPDATE %s SET "status" = $1 WHERE "name" = $2`, scheduler.tableName)
-	_, err = testDB.Exec(query, StatusFailed, job.Name())
+	_, err = testDB.Exec(query, statusFailed, job.Name())
 	require.NoError(t, err)
 
 	// Run the cleaner
@@ -560,7 +564,7 @@ func TestOrphanedJobMonitor(t *testing.T) {
 		INSERT INTO %s ("key", "name", "picked", "heartbeat", "job_type", "status", "next_run")
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		scheduler.tableName)
-	_, err := testDB.Exec(query, orphanedJobKey, "orphaned_job", false, fakeClock.Now().UTC().Add(-2*time.Hour), JobTypeRecurring, StatusPending, fakeClock.Now().UTC())
+	_, err := testDB.Exec(query, orphanedJobKey, "orphaned_job", false, fakeClock.Now().UTC().Add(-2*time.Hour), JobTypeRecurring, statusPending, fakeClock.Now().UTC())
 	require.NoError(t, err)
 
 	// Create a non-orphaned job (in the job registry)

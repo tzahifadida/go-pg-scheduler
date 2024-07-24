@@ -1,16 +1,16 @@
 # PGScheduler
 
-PGScheduler is a robust and flexible job scheduling library for Go applications using PostgreSQL as a backend. It supports both recurring and one-time jobs, with features like automatic retries, heartbeat monitoring, and orphaned job cleanup.
+PGScheduler is a robust and flexible distributed job scheduling library for Go applications using PostgreSQL as a backend. It supports both recurring and one-time jobs, with features like automatic retries, heartbeat monitoring, and orphaned job cleanup.
 
 ## Features
 
 - Support for recurring (cron-based) and one-time jobs
+- Ensures only one instance of a job runs at the same time across distributed nodes
 - Automatic retries for failed jobs
 - Heartbeat monitoring to detect and reset stalled jobs
-- Orphaned job cleanup
-- Configurable concurrency limits
-- Support for both `lib/pq` and `jackc/pgx` database drivers
-- Ensures only one instance of a recurring job runs at a time across distributed nodes
+- Orphaned job cleanup (delayed, to support rollbacks)
+- Configurable node job concurrency limits
+- Support for both `lib/pq` and `jackc/pgx` or any other database/sql based drivers
 
 ## Installation
 
@@ -90,12 +90,19 @@ func main() {
         panic(err)
     }
 
+    // also creates the schema if missing
     err = scheduler.Init()
     if err != nil {
         panic(err)
     }
+    // call ScheduleJob here if you specified RunImmediately = true
 
-    // Use the scheduler...
+	// starts job processing
+    err = scheduler.Start()
+    if err != nil {
+        panic(err)
+    }
+    // call ScheduleJob here
 
     scheduler.Shutdown()
 }
