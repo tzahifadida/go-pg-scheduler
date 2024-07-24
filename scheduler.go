@@ -1,3 +1,6 @@
+// Package pgscheduler provides a PostgreSQL-based job scheduler for Go applications.
+// It allows for scheduling and managing both recurring and one-time jobs with
+// configurable concurrency, timeouts, and retry mechanisms.
 package pgscheduler
 
 import (
@@ -20,8 +23,10 @@ import (
 var jobRegistry = make(map[string]Job)
 var jobRegistryRWLock sync.RWMutex
 
+// JobType represents the type of a job (Recurring or OneTime).
 type JobType int
 
+// ClusterSchedulerParametersKey is the context key for storing job parameters.
 const ClusterSchedulerParametersKey = "ClusterSchedulerParametersKey"
 
 const (
@@ -40,23 +45,39 @@ const (
 	statusFailed    status = "failed"
 )
 
+// JobRunnerI defines the interface for job execution.
 type JobRunnerI interface {
+	// Run executes the job with the given context.
+	// It returns an error if the job execution fails.
 	Run(ctx context.Context) error
 }
 
+// JobConfigI defines the interface for job configuration.
 type JobConfigI interface {
+	// Name returns the name of the job.
 	Name() string
+
+	// CronSchedule returns the cron schedule string for recurring jobs.
+	// For one-time jobs, this will be an empty string.
 	CronSchedule() string
+
+	// JobType returns the type of the job (Recurring or OneTime).
 	JobType() JobType
+
+	// Parameters returns the parameters associated with the job.
 	Parameters() interface{}
+
+	// Retries returns the number of retries allowed for the job (relevant to one time jobs).
 	Retries() int
 }
 
+// Job is an interface that combines JobConfigI and JobRunnerI.
 type Job interface {
 	JobConfigI
 	JobRunnerI
 }
 
+// JobConfig represents the configuration for a job.
 type JobConfig struct {
 	name         string
 	cronSchedule string
@@ -71,6 +92,15 @@ func (jc *JobConfig) JobType() JobType        { return jc.jobType }
 func (jc *JobConfig) Parameters() interface{} { return jc.parameters }
 func (jc *JobConfig) Retries() int            { return jc.retries }
 
+// NewRecurringJobConfig creates a new JobConfig for a recurring job.
+//
+// Parameters:
+//   - name: A string representing the name of the job. Essentially an identifier for the Job code.
+//   - cronSchedule: A string representing the cron schedule for the job.
+//
+// Returns:
+//   - *JobConfig: A pointer to the created JobConfig.
+//   - error: An error if the cron schedule is invalid or the name is empty.
 func NewRecurringJobConfig(name string, cronSchedule string) (*JobConfig, error) {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	_, err := parser.Parse(cronSchedule)
@@ -90,6 +120,16 @@ func NewRecurringJobConfig(name string, cronSchedule string) (*JobConfig, error)
 	}, nil
 }
 
+// NewOneTimeJobConfig creates a new JobConfig for a one-time job.
+//
+// Parameters:
+//   - name: A string representing the name of the job.
+//   - parameters: An interface{} containing any parameters needed for the job.
+//   - retries: An int representing the number of retries allowed for the job.
+//
+// Returns:
+//   - *JobConfig: A pointer to the created JobConfig.
+//   - error: An error if the retries are negative or the name is empty.
 func NewOneTimeJobConfig(name string, parameters interface{}, retries int) (*JobConfig, error) {
 	if retries < 0 {
 		return nil, fmt.Errorf("retries must be non-negative")
@@ -117,6 +157,7 @@ func getJobKey(j Job) (string, error) {
 	return j.Name(), nil
 }
 
+// Logger defines the interface for logging operations.
 type Logger interface {
 	Debug(msg string, args ...any)
 	Info(msg string, args ...any)
@@ -124,6 +165,7 @@ type Logger interface {
 	Error(msg string, args ...any)
 }
 
+// SchedulerConfig represents the configuration for the Scheduler.
 type SchedulerConfig struct {
 	Ctx                                  context.Context
 	DB                                   *sql.DB
@@ -143,6 +185,7 @@ type SchedulerConfig struct {
 	clock                                clockwork.Clock
 }
 
+// Scheduler manages the execution of jobs.
 type Scheduler struct {
 	initialized  bool
 	started      bool
@@ -176,6 +219,14 @@ type jobRecord struct {
 	ConsecutiveFailures int             `db:"consecutive_failures"`
 }
 
+// NewScheduler creates a new Scheduler instance with the given configuration.
+//
+// Parameters:
+//   - config: A SchedulerConfig struct containing the configuration for the scheduler.
+//
+// Returns:
+//   - *Scheduler: A pointer to the created Scheduler.
+//   - error: An error if the configuration is invalid or initialization fails.
 func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	if config.MaxConcurrentRecurringJobs < 0 {
 		return nil, fmt.Errorf("MaxConcurrentRecurringJobs must be at least 1")
@@ -287,6 +338,10 @@ func (s *Scheduler) createSchemaIfMissing() error {
 	return nil
 }
 
+// Init initializes the Scheduler, creating the necessary database schema if required.
+//
+// Returns:
+//   - error: An error if initialization fails.
 func (s *Scheduler) Init() error {
 	if s.initialized {
 		return fmt.Errorf("scheduler is already initialized")
@@ -301,6 +356,10 @@ func (s *Scheduler) Init() error {
 	return nil
 }
 
+// Start begins the job processing routines of the Scheduler.
+//
+// Returns:
+//   - error: An error if starting the scheduler fails.
 func (s *Scheduler) Start() error {
 	if !s.initialized {
 		return fmt.Errorf("scheduler was not initialized")
@@ -316,6 +375,7 @@ func (s *Scheduler) Start() error {
 	return nil
 }
 
+// Shutdown gracefully stops the Scheduler and its running jobs.
 func (s *Scheduler) Shutdown() {
 	if !s.started {
 		s.config.Logger.Error("cannot shutdown scheduler, scheduler was not started")
@@ -343,6 +403,13 @@ func (s *Scheduler) Shutdown() {
 	}
 }
 
+// ScheduleJob adds a new job to the Scheduler.
+//
+// Parameters:
+//   - job: A Job interface representing the job to be scheduled.
+//
+// Returns:
+//   - error: An error if scheduling the job fails.
 func (s *Scheduler) ScheduleJob(job Job) error {
 	if !s.initialized {
 		return fmt.Errorf("scheduler was not initialized")
