@@ -618,9 +618,9 @@ func (s *Scheduler) recoverLogAndFail(msg string, jobKey string, job Job, retrie
 	if p := recover(); p != nil {
 		if err, ok := p.(error); ok {
 			s.config.Logger.Error(msg+": %w, stack: %s", err, string(debug.Stack()))
-			return
+		} else {
+			s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
 		}
-		s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
 		s.markJobFailed(jobKey, job.JobType(), retries, s.clock.Now().UTC().Sub(startTime))
 	}
 }
@@ -666,7 +666,7 @@ func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, e
 		nextRun := s.clock.Now().UTC().Add(s.config.JobCheckInterval)
 		query := fmt.Sprintf(`
 			UPDATE %s 
-			SET "status" = $1, "next_run" = $2, "retries" = $3, 
+			SET "picked" = false, "status" = $1, "next_run" = $2, "retries" = $3, 
 				"execution_time" = $4, "last_failure" = $5, 
 				"consecutive_failures" = "consecutive_failures" + 1
 			WHERE "key" = $6`, s.tableName)
@@ -679,7 +679,7 @@ func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, e
 		maxTime := time.Unix(1<<63-62135596801, 999999999)
 		query := fmt.Sprintf(`
 			UPDATE %s 
-			SET "status" = $1, "next_run" = $2, "execution_time" = $3, 
+			SET "picked" = false, "status" = $1, "next_run" = $2, "execution_time" = $3, 
 				"last_failure" = $4, "consecutive_failures" = "consecutive_failures" + 1
 			WHERE "key" = $5`, s.tableName)
 		_, err := s.config.DB.Exec(query, statusFailed, maxTime, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
@@ -689,7 +689,7 @@ func (s *Scheduler) markJobFailed(jobKey string, jobType JobType, retries int, e
 	} else {
 		query := fmt.Sprintf(`
 			UPDATE %s 
-			SET "status" = $1, "execution_time" = $2, 
+			SET "picked" = false, "status" = $1, "execution_time" = $2, 
 				"last_failure" = $3, "consecutive_failures" = "consecutive_failures" + 1
 			WHERE "key" = $4`, s.tableName)
 		_, err := s.config.DB.Exec(query, statusFailed, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
