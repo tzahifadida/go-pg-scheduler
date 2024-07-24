@@ -36,7 +36,7 @@ type SchedulerConfig struct {
     DB                                   *sql.DB
     DBDriverName                         string
     MaxConcurrentOneTimeJobs             int
-	MaxConcurrentRecurringJobs           int
+    MaxConcurrentRecurringJobs           int
     JobCheckInterval                     time.Duration
     OrphanedJobTimeout                   time.Duration
     HeartbeatInterval                    time.Duration
