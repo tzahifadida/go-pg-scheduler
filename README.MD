@@ -35,7 +35,8 @@ type SchedulerConfig struct {
     Ctx                                  context.Context
     DB                                   *sql.DB
     DBDriverName                         string
-    MaxConcurrentJobs                    int
+    MaxConcurrentOneTimeJobs             int
+	MaxConcurrentRecurringJobs           int
     JobCheckInterval                     time.Duration
     OrphanedJobTimeout                   time.Duration
     HeartbeatInterval                    time.Duration
@@ -52,7 +53,8 @@ type SchedulerConfig struct {
 - `Ctx`: The context for the scheduler. If not provided, a background context will be used.
 - `DB`: A `*sql.DB` instance for database operations.
 - `DBDriverName`: The name of the database driver ("postgres" for `lib/pq`, "pgx" for `jackc/pgx`).
-- `MaxConcurrentJobs`: The maximum number of jobs that can run concurrently.
+- `MaxConcurrentOneTimeJobs`: The maximum number of jobs that can run concurrently.
+- `MaxConcurrentRecurringJobs`: The maximum number of jobs that can run concurrently.
 - `JobCheckInterval`: How often to check for new jobs to run.
 - `OrphanedJobTimeout`: The duration after which a job is considered orphaned (default: 14 days).
 - `HeartbeatInterval`: How often to update the heartbeat for running jobs.
@@ -85,8 +87,6 @@ func main() {
     config := pgscheduler.SchedulerConfig{
         DB:                db,
         DBDriverName:      "postgres",
-        MaxConcurrentJobs: 10,
-        JobRetentionDays:  7,
         JobCheckInterval:  time.Minute,
         CreateSchema:      true,
     }
