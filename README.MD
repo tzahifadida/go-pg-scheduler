@@ -2,6 +2,10 @@
 
 PGScheduler is a robust and flexible distributed job scheduling library for Go applications using PostgreSQL as a backend. It supports both recurring and one-time jobs, with features like automatic retries, heartbeat monitoring, and orphaned job cleanup.
 
+⭐️ Please Star This Project
+
+If you find this project useful, please consider giving it a star ⭐️ on GitHub. It helps others find the project and shows your support!
+
 ## Features
 
 - Support for recurring (cron-based) and one-time jobs
