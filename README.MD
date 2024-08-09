@@ -15,6 +15,7 @@ If you find this project useful, please consider giving it a star ⭐️ on GitH
 - Orphaned job cleanup (delayed, to support rollbacks)
 - Configurable node job concurrency limits
 - Support for both `lib/pq` and `jackc/pgx` or any other database/sql based drivers
+- Custom schema support for job tables
 
 ### Distributed Execution
 
@@ -46,29 +47,31 @@ type SchedulerConfig struct {
     HeartbeatInterval                    time.Duration
     NoHeartbeatTimeout                   time.Duration
     CreateSchema                         bool
-    Logger                               *slog.Logger
+    Logger                               Logger
     RunImmediately                       bool
     TablePrefix                          string
     ShutdownTimeout                      time.Duration
     FailedAndCompletedOneTimeJobInterval time.Duration
+    Schema                               string
 }
 ```
 
 - `Ctx`: The context for the scheduler. If not provided, a background context will be used.
 - `DB`: A `*sql.DB` instance for database operations.
 - `DBDriverName`: The name of the database driver ("postgres" for `lib/pq`, "pgx" for `jackc/pgx`).
-- `MaxConcurrentOneTimeJobs`: The maximum number of jobs that can run concurrently.
-- `MaxConcurrentRecurringJobs`: The maximum number of jobs that can run concurrently.
+- `MaxConcurrentOneTimeJobs`: The maximum number of one-time jobs that can run concurrently.
+- `MaxConcurrentRecurringJobs`: The maximum number of recurring jobs that can run concurrently.
 - `JobCheckInterval`: How often to check for new jobs to run.
 - `OrphanedJobTimeout`: The duration after which a job is considered orphaned (default: 14 days).
 - `HeartbeatInterval`: How often to update the heartbeat for running jobs.
 - `NoHeartbeatTimeout`: The duration after which a job with no heartbeat is considered failed.
 - `CreateSchema`: Whether to automatically create the required database schema.
-- `Logger`: A `slog.Logger` instance for logging.
+- `Logger`: A `Logger` interface instance for logging.
 - `RunImmediately`: Whether to run jobs immediately upon scheduler start.
 - `TablePrefix`: A prefix for the database table name.
 - `ShutdownTimeout`: The maximum duration to wait for jobs to complete during shutdown.
 - `FailedAndCompletedOneTimeJobInterval`: How often to clean up failed and completed one-time jobs.
+- `Schema`: The PostgreSQL schema to use for the job tables (default: "public").
 
 ## Usage
 
@@ -93,6 +96,7 @@ func main() {
         DBDriverName:      "postgres",
         JobCheckInterval:  time.Minute,
         CreateSchema:      true,
+        Schema:            "custom_schema", // Optional: specify a custom schema
     }
 
     scheduler, err := pgscheduler.NewScheduler(config)
@@ -107,7 +111,7 @@ func main() {
     }
     // call ScheduleJob here if you specified RunImmediately = true
 
-	// starts job processing
+    // starts job processing
     err = scheduler.Start()
     if err != nil {
         panic(err)
@@ -214,6 +218,7 @@ func main() {
     config := pgscheduler.SchedulerConfig{
         DB:           db,
         DBDriverName: "postgres",
+        Schema:       "custom_schema", // Optional: specify a custom schema
         // ... other configuration options
     }
 
@@ -246,6 +251,7 @@ func main() {
     config := pgscheduler.SchedulerConfig{
         DB:           db,
         DBDriverName: "pgx",
+        Schema:       "custom_schema", // Optional: specify a custom schema
         // ... other configuration options
     }
 
@@ -262,11 +268,12 @@ func main() {
 
 1. Always call `scheduler.Shutdown()` when your application is terminating to ensure proper cleanup.
 2. Don't create a job Name for jobs with slightly different behavior. For one time jobs you can use parameters passing instead. Excessive job "Name"s will damage performance since each job code is kept in memory with Name as key and queries use a filter such as "IN (Names...)".
-2. Use appropriate retry counts for one-time jobs to handle transient failures.
-3. Implement proper error handling in your job's `Run` method.
-4. Use the context passed to the `Run` method for cancellation and timeout handling.
-5. Keep job execution times reasonable. For long-running jobs, consider breaking them into smaller tasks.
-6. In distributed environments, be aware that only one instance of a recurring job will run at a time across all nodes.
+3. Use appropriate retry counts for one-time jobs to handle transient failures.
+4. Implement proper error handling in your job's `Run` method.
+5. Use the context passed to the `Run` method for cancellation and timeout handling.
+6. Keep job execution times reasonable. For long-running jobs, consider breaking them into smaller tasks.
+7. In distributed environments, be aware that only one instance of a recurring job will run at a time across all nodes.
+8. When using custom schemas, ensure that your database user has the necessary permissions to create and access the specified schema.
 
 ## Contributing
 

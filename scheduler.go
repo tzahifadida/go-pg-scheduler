@@ -36,6 +36,8 @@ const (
 	jobTypeLast // This should always be the last constant
 )
 
+const scheduledJobsTableName = "scheduled_jobs"
+
 type status string
 
 const (
@@ -182,6 +184,7 @@ type SchedulerConfig struct {
 	TablePrefix                          string
 	ShutdownTimeout                      time.Duration
 	FailedAndCompletedOneTimeJobInterval time.Duration
+	Schema                               string // New field for custom schema
 	clock                                clockwork.Clock
 }
 
@@ -286,6 +289,10 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		config.FailedAndCompletedOneTimeJobInterval = 1 * time.Hour
 	}
 
+	if config.Schema == "" {
+		config.Schema = "public" // Set default schema to "public" if not specified
+	}
+
 	nodeID := uuid.New()
 	ctx := context.Background()
 	if config.Ctx != nil {
@@ -300,13 +307,19 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		shutdownChan: make(chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
-		tableName:    config.TablePrefix + "scheduled_jobs",
+		tableName:    fmt.Sprintf(`"%s"."%s"`, config.Schema, config.TablePrefix+scheduledJobsTableName),
 		runningJobs:  sync.Map{},
 		clock:        config.clock,
 	}, nil
 }
 
 func (s *Scheduler) createSchemaIfMissing() error {
+	createSchema := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, s.config.Schema)
+	_, err := s.config.DB.Exec(createSchema)
+	if err != nil {
+		return fmt.Errorf("failed to create schema: %w", err)
+	}
+	tableNameNoQuotes := s.config.TablePrefix + scheduledJobsTableName
 	createTable := "CREATE TABLE IF NOT EXISTS"
 	schema := fmt.Sprintf(createTable+` %s (
         "key" TEXT PRIMARY KEY,
@@ -326,12 +339,12 @@ func (s *Scheduler) createSchemaIfMissing() error {
         "consecutive_failures" INT DEFAULT 0
     );
 
-    CREATE INDEX IF NOT EXISTS idx_%s_job_acquisition ON %s("job_type", "picked", "next_run");
-    CREATE INDEX IF NOT EXISTS idx_%s_heartbeat_monitor ON %s("picked", "heartbeat");
-    CREATE INDEX IF NOT EXISTS idx_%s_cleanup ON %s("last_run");
-    `, s.tableName, statusPending, s.tableName, s.tableName, s.tableName, s.tableName, s.tableName, s.tableName)
+    CREATE INDEX IF NOT EXISTS "idx_%s_job_acquisition" ON %s("job_type", "picked", "next_run");
+    CREATE INDEX IF NOT EXISTS "idx_%s_heartbeat_monitor" ON %s("picked", "heartbeat");
+    CREATE INDEX IF NOT EXISTS "idx_%s_cleanup" ON %s("last_run");
+    `, s.tableName, statusPending, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName)
 
-	_, err := s.config.DB.Exec(schema)
+	_, err = s.config.DB.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
