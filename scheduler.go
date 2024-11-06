@@ -1,6 +1,3 @@
-// Package pgscheduler provides a PostgreSQL-based job scheduler for Go applications.
-// It allows for scheduling and managing both recurring and one-time jobs with
-// configurable concurrency, timeouts, and retry mechanisms.
 package pgscheduler
 
 import (
@@ -9,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tzahifadida/pgln"
 	"log/slog"
+	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,146 +20,74 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-var jobRegistry = make(map[string]Job)
-var jobRegistryRWLock sync.RWMutex
-
-// JobType represents the type of a job (Recurring or OneTime).
-type JobType int
-
-// ClusterSchedulerParametersKey is the context key for storing job parameters.
-const ClusterSchedulerParametersKey = "ClusterSchedulerParametersKey"
+var epochStart = time.Unix(0, 0).UTC()
 
 const (
-	JobTypeRecurring JobType = iota
-	JobTypeOneTime
-
-	jobTypeLast // This should always be the last constant
+	ClusterSchedulerParametersKey = "ClusterSchedulerParametersKey"
+	scheduledJobsTableName        = "scheduled_jobs"
+	jobKeySeparator               = "@@"
 )
 
-const scheduledJobsTableName = "scheduled_jobs"
-
-type status string
+type Status string
 
 const (
-	statusPending   status = "pending"
-	statusRunning   status = "running"
-	statusCompleted status = "completed"
-	statusFailed    status = "failed"
+	StatusPending   Status = "pending"
+	StatusRunning   Status = "running"
+	StatusCompleted Status = "completed"
+	StatusFailed    Status = "failed"
 )
 
-// JobRunnerI defines the interface for job execution.
-type JobRunnerI interface {
-	// Run executes the job with the given context.
-	// It returns an error if the job execution fails.
-	Run(ctx context.Context) error
+// Custom errors
+var (
+	ErrJobNotFound   = errors.New("job not found")
+	ErrJobRunning    = errors.New("job is currently running")
+	ErrJobNotRunning = errors.New("job exists but is not currently running")
+)
+
+// NextRunCalculator defines how to calculate the next run time
+type NextRunCalculator interface {
+	NextRun(now time.Time) (time.Time, error)
 }
 
-// JobConfigI defines the interface for job configuration.
-type JobConfigI interface {
-	// Name returns the name of the job.
-	Name() string
-
-	// CronSchedule returns the cron schedule string for recurring jobs.
-	// For one-time jobs, this will be an empty string.
-	CronSchedule() string
-
-	// JobType returns the type of the job (Recurring or OneTime).
-	JobType() JobType
-
-	// Parameters returns the parameters associated with the job.
-	Parameters() interface{}
-
-	// Retries returns the number of retries allowed for the job (relevant to one time jobs).
-	Retries() int
+// CronSchedule implements NextRunCalculator using cron expressions
+type CronSchedule struct {
+	expression string
+	parser     cron.Parser
 }
 
-// Job is an interface that combines JobConfigI and JobRunnerI.
-type Job interface {
-	JobConfigI
-	JobRunnerI
-}
-
-// JobConfig represents the configuration for a job.
-type JobConfig struct {
-	name         string
-	cronSchedule string
-	jobType      JobType
-	parameters   interface{}
-	retries      int
-}
-
-func (jc *JobConfig) Name() string            { return jc.name }
-func (jc *JobConfig) CronSchedule() string    { return jc.cronSchedule }
-func (jc *JobConfig) JobType() JobType        { return jc.jobType }
-func (jc *JobConfig) Parameters() interface{} { return jc.parameters }
-func (jc *JobConfig) Retries() int            { return jc.retries }
-
-// NewRecurringJobConfig creates a new JobConfig for a recurring job.
-//
-// Parameters:
-//   - name: A string representing the name of the job. Essentially an identifier for the Job code.
-//   - cronSchedule: A string representing the cron schedule for the job.
-//
-// Returns:
-//   - *JobConfig: A pointer to the created JobConfig.
-//   - error: An error if the cron schedule is invalid or the name is empty.
-func NewRecurringJobConfig(name string, cronSchedule string) (*JobConfig, error) {
+func NewCronSchedule(expression string) (*CronSchedule, error) {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	_, err := parser.Parse(cronSchedule)
+	if _, err := parser.Parse(expression); err != nil {
+		return nil, fmt.Errorf("invalid cron expression: %w", err)
+	}
+	return &CronSchedule{
+		expression: expression,
+		parser:     parser,
+	}, nil
+}
+
+func (c *CronSchedule) NextRun(now time.Time) (time.Time, error) {
+	schedule, err := c.parser.Parse(c.expression)
 	if err != nil {
-		return nil, fmt.Errorf("invalid cron schedule: %w", err)
+		return time.Time{}, fmt.Errorf("failed to parse cron schedule: %w", err)
 	}
-	if len(name) == 0 {
-		return nil, fmt.Errorf("name cannot be empty")
-	}
-
-	return &JobConfig{
-		name:         name,
-		cronSchedule: cronSchedule,
-		jobType:      JobTypeRecurring,
-		parameters:   nil,
-		retries:      0,
-	}, nil
+	return schedule.Next(now), nil
 }
 
-// NewOneTimeJobConfig creates a new JobConfig for a one-time job.
-//
-// Parameters:
-//   - name: A string representing the name of the job.
-//   - parameters: An interface{} containing any parameters needed for the job.
-//   - retries: An int representing the number of retries allowed for the job.
-//
-// Returns:
-//   - *JobConfig: A pointer to the created JobConfig.
-//   - error: An error if the retries are negative or the name is empty.
-func NewOneTimeJobConfig(name string, parameters interface{}, retries int) (*JobConfig, error) {
-	if retries < 0 {
-		return nil, fmt.Errorf("retries must be non-negative")
-	}
-	if len(name) == 0 {
-		return nil, fmt.Errorf("name cannot be empty")
-	}
-	return &JobConfig{
-		name:         name,
-		cronSchedule: "",
-		jobType:      JobTypeOneTime,
-		parameters:   parameters,
-		retries:      retries,
-	}, nil
+// FixedInterval implements NextRunCalculator using fixed time intervals
+type FixedInterval struct {
+	interval time.Duration
 }
 
-func getJobKey(j Job) (string, error) {
-	if j.JobType() == JobTypeOneTime {
-		random, err := uuid.NewRandom()
-		if err != nil {
-			return "", fmt.Errorf("failed to generate job key: %w", err)
-		}
-		return fmt.Sprintf("%s#%s", j.Name(), random.String()), nil
-	}
-	return j.Name(), nil
+func NewFixedInterval(interval time.Duration) *FixedInterval {
+	return &FixedInterval{interval: interval}
 }
 
-// Logger defines the interface for logging operations.
+func (f *FixedInterval) NextRun(now time.Time) (time.Time, error) {
+	return now.Add(f.interval), nil
+}
+
+// Logger defines the interface for logging operations
 type Logger interface {
 	Debug(msg string, args ...any)
 	Info(msg string, args ...any)
@@ -167,13 +95,40 @@ type Logger interface {
 	Error(msg string, args ...any)
 }
 
-// SchedulerConfig represents the configuration for the Scheduler.
+// Job defines the interface for a schedulable job
+type Job interface {
+	Name() string
+	Key() string
+	Run(ctx context.Context) error
+	NextRunCalculator() NextRunCalculator
+	Parameters() interface{}
+	MaxRetries() int
+}
+
+type JobRecord struct {
+	Name                string          `db:"name"`
+	Key                 string          `db:"key"`
+	LastRun             sql.NullTime    `db:"last_run"`
+	Picked              bool            `db:"picked"`
+	PickedBy            uuid.NullUUID   `db:"picked_by"`
+	Heartbeat           sql.NullTime    `db:"heartbeat"`
+	NextRun             *time.Time      `db:"next_run"`
+	Parameters          json.RawMessage `db:"parameters"`
+	Status              Status          `db:"status"`
+	Retries             int             `db:"retries"`
+	ExecutionTime       sql.NullInt64   `db:"execution_time"`
+	LastSuccess         sql.NullTime    `db:"last_success"`
+	LastFailure         sql.NullTime    `db:"last_failure"`
+	ConsecutiveFailures int             `db:"consecutive_failures"`
+	CancelRequested     bool            `db:"cancel_requested"`
+}
+
+// SchedulerConfig represents the configuration for the Scheduler
 type SchedulerConfig struct {
 	Ctx                                  context.Context
 	DB                                   *sql.DB
 	DBDriverName                         string
-	MaxConcurrentOneTimeJobs             int
-	MaxConcurrentRecurringJobs           int
+	MaxRunningJobs                       int
 	JobCheckInterval                     time.Duration
 	OrphanedJobTimeout                   time.Duration
 	HeartbeatInterval                    time.Duration
@@ -183,62 +138,44 @@ type SchedulerConfig struct {
 	RunImmediately                       bool
 	TablePrefix                          string
 	ShutdownTimeout                      time.Duration
-	FailedAndCompletedOneTimeJobInterval time.Duration
-	Schema                               string // New field for custom schema
+	FailedAndCompletedJobCleanupInterval time.Duration
+	CancelCheckPeriod                    time.Duration
+	Schema                               string
 	clock                                clockwork.Clock
+	PGLNInstance                         *pgln.PGListenNotify
 }
 
-// Scheduler manages the execution of jobs.
 type Scheduler struct {
-	initialized  bool
-	started      bool
-	config       SchedulerConfig
-	db           *sqlx.DB
-	nodeID       uuid.UUID
-	shutdownChan chan struct{}
-	wg           sync.WaitGroup
-	ctx          context.Context
-	cancel       context.CancelFunc
-	tableName    string
-	runningJobs  sync.Map
-	clock        clockwork.Clock
+	initialized            bool
+	started                bool
+	config                 SchedulerConfig
+	db                     *sqlx.DB
+	nodeID                 uuid.UUID
+	shutdownChan           chan struct{}
+	wg                     sync.WaitGroup
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	tableName              string
+	runningJobsCount       int64
+	runningJobsMutex       sync.RWMutex
+	cancelFuncs            sync.Map
+	jobRegistry            map[string]Job
+	jobRegistryRWLock      sync.RWMutex
+	jobNames               []string
+	clock                  clockwork.Clock
+	notifyChannelJobReady  string // Added for PGLN
+	notifyChannelJobCancel string // Added for PGLN
 }
 
-type jobRecord struct {
-	Key                 string          `db:"key"`
-	Name                string          `db:"name"`
-	LastRun             sql.NullTime    `db:"last_run"`
-	Picked              bool            `db:"picked"`
-	PickedBy            uuid.NullUUID   `db:"picked_by"`
-	Heartbeat           sql.NullTime    `db:"heartbeat"`
-	NextRun             time.Time       `db:"next_run"`
-	JobType             JobType         `db:"job_type"`
-	Parameters          json.RawMessage `db:"parameters"`
-	Status              status          `db:"status"`
-	Retries             int             `db:"retries"`
-	ExecutionTime       sql.NullInt64   `db:"execution_time"`
-	LastSuccess         sql.NullTime    `db:"last_success"`
-	LastFailure         sql.NullTime    `db:"last_failure"`
-	ConsecutiveFailures int             `db:"consecutive_failures"`
+type cancelTracker struct {
+	sync.RWMutex
+	cancelled map[string]bool
 }
 
-// NewScheduler creates a new Scheduler instance with the given configuration.
-//
-// Parameters:
-//   - config: A SchedulerConfig struct containing the configuration for the scheduler.
-//
-// Returns:
-//   - *Scheduler: A pointer to the created Scheduler.
-//   - error: An error if the configuration is invalid or initialization fails.
+func getCancelKey(name, key string) string {
+	return name + jobKeySeparator + key
+}
 func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
-	if config.MaxConcurrentRecurringJobs < 0 {
-		return nil, fmt.Errorf("MaxConcurrentRecurringJobs must be at least 1")
-	}
-
-	if config.MaxConcurrentOneTimeJobs < 0 {
-		return nil, fmt.Errorf("MaxConcurrentOneTimeJobs must be at least 1")
-	}
-
 	if config.DB == nil {
 		return nil, fmt.Errorf("database connection is required")
 	}
@@ -247,15 +184,11 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		return nil, fmt.Errorf("database driver name is required")
 	}
 
-	// Wrap the *sql.DB with sqlx
-	sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
+	if config.MaxRunningJobs <= 0 {
+		config.MaxRunningJobs = 10
+	}
 
-	if config.MaxConcurrentOneTimeJobs == 0 {
-		config.MaxConcurrentOneTimeJobs = 2
-	}
-	if config.MaxConcurrentRecurringJobs == 0 {
-		config.MaxConcurrentRecurringJobs = 2
-	}
+	sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
 
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -285,12 +218,16 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		config.ShutdownTimeout = 30 * time.Second
 	}
 
-	if config.FailedAndCompletedOneTimeJobInterval == 0 {
-		config.FailedAndCompletedOneTimeJobInterval = 1 * time.Hour
+	if config.FailedAndCompletedJobCleanupInterval == 0 {
+		config.FailedAndCompletedJobCleanupInterval = 10 * time.Minute
+	}
+
+	if config.CancelCheckPeriod == 0 {
+		config.CancelCheckPeriod = 30 * time.Second
 	}
 
 	if config.Schema == "" {
-		config.Schema = "public" // Set default schema to "public" if not specified
+		config.Schema = "public"
 	}
 
 	nodeID := uuid.New()
@@ -300,61 +237,89 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
-	return &Scheduler{
-		config:       config,
-		db:           sqlxDB,
-		nodeID:       nodeID,
-		shutdownChan: make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
-		tableName:    fmt.Sprintf(`"%s"."%s"`, config.Schema, config.TablePrefix+scheduledJobsTableName),
-		runningJobs:  sync.Map{},
-		clock:        config.clock,
-	}, nil
+	prefix := config.TablePrefix
+	if prefix == "" {
+		prefix = "scheduler"
+	}
+
+	s := &Scheduler{
+		config:                 config,
+		db:                     sqlxDB,
+		nodeID:                 nodeID,
+		shutdownChan:           make(chan struct{}),
+		ctx:                    ctx,
+		cancel:                 cancel,
+		tableName:              fmt.Sprintf(`"%s"."%s"`, config.Schema, prefix+scheduledJobsTableName),
+		cancelFuncs:            sync.Map{},
+		jobRegistry:            make(map[string]Job),
+		clock:                  config.clock,
+		notifyChannelJobReady:  fmt.Sprintf("%s_job_ready", prefix),
+		notifyChannelJobCancel: fmt.Sprintf("%s_job_cancel", prefix),
+	}
+	if config.PGLNInstance != nil {
+		if err := s.setupPGLN(); err != nil {
+			return nil, fmt.Errorf("failed to setup PGLN: %w", err)
+		}
+	}
+	return s, nil
 }
-
-func (s *Scheduler) createSchemaIfMissing() error {
-	createSchema := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, s.config.Schema)
-	_, err := s.config.DB.Exec(createSchema)
+func (s *Scheduler) setupPGLN() error {
+	// Setup listener for job ready notifications
+	err := s.config.PGLNInstance.ListenAndWaitForListening(s.notifyChannelJobReady, pgln.ListenOptions{
+		NotificationCallback: func(channel string, payload string) {
+			s.config.Logger.Debug("received job ready notification", "payload", payload)
+			go func() {
+				if err := s.processJobs(); err != nil {
+					s.config.Logger.Error("error processing jobs from notification", "error", err)
+				}
+			}()
+		},
+		ErrorCallback: func(channel string, err error) {
+			s.config.Logger.Error("job ready notification error", "error", err)
+		},
+		OutOfSyncBlockingCallback: func(channel string) error {
+			s.config.Logger.Info("job ready channel out of sync, checking for pending jobs", "channel", channel)
+			if err := s.processJobs(); err != nil {
+				return fmt.Errorf("error processing jobs during out of sync: %w", err)
+			}
+			return nil
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create schema: %w", err)
+		return fmt.Errorf("failed to setup job ready listener: %w", err)
 	}
-	tableNameNoQuotes := s.config.TablePrefix + scheduledJobsTableName
-	createTable := "CREATE TABLE IF NOT EXISTS"
-	schema := fmt.Sprintf(createTable+` %s (
-        "key" TEXT PRIMARY KEY,
-        "name" TEXT,
-        "last_run" TIMESTAMP,
-        "picked" BOOLEAN,
-        "picked_by" UUID,
-        "heartbeat" TIMESTAMP,
-        "next_run" TIMESTAMP,
-        "job_type" SMALLINT DEFAULT 0,
-        "parameters" JSONB,
-        "status" TEXT DEFAULT '%s',
-        "retries" INT DEFAULT 0,
-        "execution_time" INT DEFAULT 0,
-        "last_success" TIMESTAMP,
-        "last_failure" TIMESTAMP,
-        "consecutive_failures" INT DEFAULT 0
-    );
 
-    CREATE INDEX IF NOT EXISTS "idx_%s_job_acquisition" ON %s("job_type", "picked", "next_run");
-    CREATE INDEX IF NOT EXISTS "idx_%s_heartbeat_monitor" ON %s("picked", "heartbeat");
-    CREATE INDEX IF NOT EXISTS "idx_%s_cleanup" ON %s("last_run");
-    `, s.tableName, statusPending, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName)
+	// Setup listener for job cancellation notifications
+	err = s.config.PGLNInstance.ListenAndWaitForListening(s.notifyChannelJobCancel, pgln.ListenOptions{
+		NotificationCallback: func(channel string, payload string) {
+			var cancelInfo struct {
+				Name string `json:"name"`
+				Key  string `json:"key"`
+			}
+			if err := json.Unmarshal([]byte(payload), &cancelInfo); err != nil {
+				s.config.Logger.Error("failed to unmarshal cancel notification", "error", err)
+				return
+			}
 
-	_, err = s.config.DB.Exec(schema)
+			go func() {
+				s.checkForCancellations()
+			}()
+		},
+		ErrorCallback: func(channel string, err error) {
+			s.config.Logger.Error("job cancel notification error", "error", err)
+		},
+		OutOfSyncBlockingCallback: func(channel string) error {
+			s.config.Logger.Info("cancel channel out of sync, checking for pending cancellations", "channel", channel)
+			s.checkForCancellations()
+			return nil
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create schema: %w", err)
+		return fmt.Errorf("failed to setup job cancel listener: %w", err)
 	}
+
 	return nil
 }
-
-// Init initializes the Scheduler, creating the necessary database schema if required.
-//
-// Returns:
-//   - error: An error if initialization fails.
 func (s *Scheduler) Init() error {
 	if s.initialized {
 		return fmt.Errorf("scheduler is already initialized")
@@ -365,30 +330,119 @@ func (s *Scheduler) Init() error {
 			return fmt.Errorf("failed to create schema: %w", err)
 		}
 	}
-
 	return nil
 }
 
-// Start begins the job processing routines of the Scheduler.
-//
-// Returns:
-//   - error: An error if starting the scheduler fails.
+func (s *Scheduler) createSchemaIfMissing() error {
+	createSchema := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, s.config.Schema)
+	_, err := s.config.DB.Exec(createSchema)
+	if err != nil {
+		return fmt.Errorf("failed to create schema: %w", err)
+	}
+
+	tableNameNoQuotes := s.config.TablePrefix + scheduledJobsTableName
+	createTable := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+        "name" TEXT,
+        "key" TEXT NOT NULL,
+        "last_run" TIMESTAMP,
+        "picked" BOOLEAN,
+        "picked_by" UUID,
+        "heartbeat" TIMESTAMP NOT NULL,
+        "next_run" TIMESTAMP,
+        "parameters" JSONB,
+        "status" TEXT DEFAULT '%s',
+        "retries" INT DEFAULT 0,
+        "execution_time" INT DEFAULT 0,
+        "last_success" TIMESTAMP,
+        "last_failure" TIMESTAMP,
+        "consecutive_failures" INT DEFAULT 0,
+        "cancel_requested" BOOLEAN DEFAULT false,
+        PRIMARY KEY ("name", "key")
+    );
+
+    CREATE INDEX IF NOT EXISTS "idx_%s_job_acquisition" ON %s("picked", "next_run");
+    CREATE INDEX IF NOT EXISTS "idx_%s_heartbeat_monitor" ON %s("picked", "heartbeat");
+    CREATE INDEX IF NOT EXISTS "idx_%s_cleanup" ON %s("last_run");
+    CREATE INDEX IF NOT EXISTS "idx_%s_cancel_monitor" ON %s("cancel_requested", "picked");
+    `, s.tableName, StatusPending, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName,
+		tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName)
+
+	_, err = s.config.DB.Exec(createTable)
+	if err != nil {
+		return fmt.Errorf("failed to create schema: %w", err)
+	}
+	return nil
+}
+
+func (s *Scheduler) RegisterJob(job Job) error {
+	if job.Name() == "" {
+		return fmt.Errorf("job name cannot be empty")
+	}
+
+	if strings.Contains(job.Name(), jobKeySeparator) {
+		return fmt.Errorf("job name cannot contain %q", jobKeySeparator)
+	}
+
+	s.jobRegistryRWLock.Lock()
+	defer s.jobRegistryRWLock.Unlock()
+
+	if _, exists := s.jobRegistry[job.Name()]; exists {
+		return fmt.Errorf("job %s is already registered", job.Name())
+	}
+
+	s.jobRegistry[job.Name()] = job
+	s.jobNames = append(s.jobNames, job.Name())
+	return nil
+}
+
+func (s *Scheduler) GetJob(name, key string) (*JobRecord, error) {
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE "name" = $1 AND "key" = $2`, s.tableName)
+	var job JobRecord
+	err := s.db.Get(&job, query, name, key)
+	if err == sql.ErrNoRows {
+		return nil, ErrJobNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get job: %w", err)
+	}
+	return &job, nil
+}
+
+func (s *Scheduler) incrementRunningJobs() {
+	s.runningJobsMutex.Lock()
+	s.runningJobsCount++
+	s.runningJobsMutex.Unlock()
+}
+
+func (s *Scheduler) decrementRunningJobs() {
+	s.runningJobsMutex.Lock()
+	s.runningJobsCount--
+	s.runningJobsMutex.Unlock()
+}
+
+func (s *Scheduler) getRunningJobsCount() int64 {
+	s.runningJobsMutex.RLock()
+	defer s.runningJobsMutex.RUnlock()
+	return s.runningJobsCount
+}
+
 func (s *Scheduler) Start() error {
 	if !s.initialized {
 		return fmt.Errorf("scheduler was not initialized")
 	}
-	s.started = true
 
-	s.wg.Add(4)
+	s.wg.Add(5)
 	go s.startJobProcessing()
-	go s.startHeartbeatMonitorForOneTimeJobs()
-	go s.startFailedAndCompletedOneTimeJobCleaner()
+	go s.startHeartbeatMonitor()
+	go s.startFailedAndCompletedJobCleaner()
 	go s.startOrphanedJobMonitor()
+	go s.startCancelMonitor()
+
+	s.started = true
 
 	return nil
 }
 
-// Shutdown gracefully stops the Scheduler and its running jobs.
 func (s *Scheduler) Shutdown() {
 	if !s.started {
 		s.config.Logger.Error("cannot shutdown scheduler, scheduler was not started")
@@ -409,32 +463,48 @@ func (s *Scheduler) Shutdown() {
 	case <-s.clock.After(s.config.ShutdownTimeout):
 		s.config.Logger.Error("shutdown timeout exceeded, some jobs may not have completed")
 	}
-	jobRegistryRWLock.Lock()
-	defer jobRegistryRWLock.Unlock()
-	for k := range jobRegistry {
-		delete(jobRegistry, k)
-	}
-}
 
-// ScheduleJob adds a new job to the Scheduler.
-//
-// Parameters:
-//   - job: A Job interface representing the job to be scheduled.
-//
-// Returns:
-//   - error: An error if scheduling the job fails.
+	s.jobRegistryRWLock.Lock()
+	defer s.jobRegistryRWLock.Unlock()
+	for k := range s.jobRegistry {
+		delete(s.jobRegistry, k)
+	}
+	s.jobNames = nil
+}
 func (s *Scheduler) ScheduleJob(job Job) error {
 	if !s.initialized {
 		return fmt.Errorf("scheduler was not initialized")
 	}
-	key, err := getJobKey(job)
-	if err != nil {
-		return fmt.Errorf("failed to get job key: %w", err)
+
+	// Check if job is registered
+	s.jobRegistryRWLock.RLock()
+	registeredJob, exists := s.jobRegistry[job.Name()]
+	s.jobRegistryRWLock.RUnlock()
+	if !exists {
+		return fmt.Errorf("job %s must be registered before scheduling", job.Name())
 	}
 
-	nextRun, err := s.calculateNextRun(job.CronSchedule())
+	// Ensure job implementations match
+	if reflect.TypeOf(registeredJob) != reflect.TypeOf(job) {
+		return fmt.Errorf("job implementation does not match registered job")
+	}
+
+	// Start transaction
+	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to calculate next run cron schedule: %w", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var nextRun time.Time
+	calculator := job.NextRunCalculator()
+	if calculator == nil {
+		nextRun = s.clock.Now().UTC()
+	} else {
+		nextRun, err = calculator.NextRun(s.clock.Now().UTC())
+		if err != nil {
+			return fmt.Errorf("failed to calculate next run: %w", err)
+		}
 	}
 
 	parameters, err := json.Marshal(job.Parameters())
@@ -443,42 +513,50 @@ func (s *Scheduler) ScheduleJob(job Job) error {
 	}
 
 	query := fmt.Sprintf(`
-		INSERT INTO %s ("key", "name", "last_run", "picked", "picked_by", "heartbeat", "next_run", "job_type", "parameters", "status", "retries")
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT ("key") DO NOTHING`, s.tableName)
+        INSERT INTO %s ("name", "key", "picked", "picked_by", "next_run", "parameters", "status", "retries", "heartbeat")
+        VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT ("name", "key") 
+        DO UPDATE SET 
+            next_run = $4,
+            parameters = $5,
+            retries = $7
+        WHERE NOT %s.picked
+        RETURNING name`,
+		s.tableName, s.tableName)
 
-	_, err = s.config.DB.Exec(query,
-		key, job.Name(), nil, false, uuid.Nil, nil, nextRun, job.JobType(), parameters, statusPending, job.Retries())
+	var returnedName string
+	err = tx.QueryRow(query,
+		job.Name(),
+		job.Key(),
+		uuid.Nil,
+		nextRun,
+		parameters,
+		StatusPending,
+		job.MaxRetries(),
+		epochStart).Scan(&returnedName)
+
+	if err == sql.ErrNoRows {
+		return ErrJobRunning
+	}
 	if err != nil {
-		return fmt.Errorf("failed to insert job: %w", err)
+		return fmt.Errorf("failed to schedule job: %w", err)
 	}
 
-	jobRegistryRWLock.Lock()
-	defer jobRegistryRWLock.Unlock()
-	if _, ok := jobRegistry[job.Name()]; ok {
-		if job.JobType() == JobTypeRecurring {
-			return fmt.Errorf("recurring job already exists in job registry: %s", key)
+	// If PGLN is configured, add notification to transaction
+	if s.config.PGLNInstance != nil {
+		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notifyChannelJobReady, "new_job")
+		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		if err != nil {
+			return fmt.Errorf("failed to add notification to transaction: %w", err)
 		}
-		// For one-time jobs, we simply don't re-add them to the registry
-		return nil
 	}
-	jobRegistry[job.Name()] = job
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
 
 	return nil
-}
-
-func (s *Scheduler) calculateNextRun(cronSchedule string) (time.Time, error) {
-	if cronSchedule == "" {
-		return s.clock.Now().UTC(), nil
-	}
-	cronParser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := cronParser.Parse(cronSchedule)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to parse cron schedule: %w", err)
-	}
-	now := s.clock.Now().UTC()
-	next := schedule.Next(now)
-	return next, nil
 }
 
 func (s *Scheduler) startJobProcessing() {
@@ -487,16 +565,8 @@ func (s *Scheduler) startJobProcessing() {
 	defer ticker.Stop()
 
 	if s.config.RunImmediately {
-		jobRegistryRWLock.RLock()
-		jobNames := make([]string, 0, len(jobRegistry))
-		for name := range jobRegistry {
-			jobNames = append(jobNames, name)
-		}
-		jobRegistryRWLock.RUnlock()
-		if len(jobNames) > 0 {
-			if err := s.processJobs(); err != nil {
-				s.config.Logger.Error("error processing jobs", "error", err)
-			}
+		if err := s.processJobs(); err != nil {
+			s.config.Logger.Error("error processing jobs", "error", err)
 		}
 	}
 
@@ -510,6 +580,546 @@ func (s *Scheduler) startJobProcessing() {
 			return
 		}
 	}
+}
+
+func (s *Scheduler) processJobs() error {
+	runningCount := s.getRunningJobsCount()
+	if runningCount >= int64(s.config.MaxRunningJobs) {
+		return nil
+	}
+
+	available := s.config.MaxRunningJobs - int(runningCount)
+	if available <= 0 {
+		return nil
+	}
+
+	if err := s.acquireAndRunJobs(available); err != nil {
+		return fmt.Errorf("error acquiring and running jobs: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Scheduler) acquireAndRunJobs(quota int) error {
+	tx, err := s.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	s.jobRegistryRWLock.RLock()
+	jobNames := s.jobNames
+	s.jobRegistryRWLock.RUnlock()
+
+	query := fmt.Sprintf(`
+        WITH available_jobs AS (
+            SELECT name, key, parameters, retries
+            FROM %s
+            WHERE name IN (?)
+            AND picked = false 
+            AND next_run <= ?
+            AND status = ?
+            ORDER BY next_run 
+            LIMIT ?
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE %s j
+        SET 
+            picked = true,
+            picked_by = ?,
+            heartbeat = ?,
+            status = ?
+        FROM available_jobs
+        WHERE j.name = available_jobs.name
+        AND j.key = available_jobs.key
+        RETURNING j.name, j.key, j.parameters, j.retries`,
+		s.tableName, s.tableName)
+
+	query, args, err := sqlx.In(query, jobNames,
+		s.clock.Now().UTC(),
+		StatusPending,
+		quota,
+		s.nodeID,
+		s.clock.Now().UTC(),
+		StatusRunning)
+	if err != nil {
+		return fmt.Errorf("failed to expand IN clause: %w", err)
+	}
+	query = tx.Rebind(query)
+
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to acquire jobs: %w", err)
+	}
+	defer rows.Close()
+
+	jobsToRun := make([]struct {
+		name       string
+		key        string
+		parameters json.RawMessage
+		retries    int
+	}, 0, quota)
+
+	for rows.Next() {
+		var job struct {
+			name       string
+			key        string
+			parameters json.RawMessage
+			retries    int
+		}
+		if err := rows.Scan(&job.name, &job.key, &job.parameters, &job.retries); err != nil {
+			return fmt.Errorf("failed to scan job row: %w", err)
+		}
+		jobsToRun = append(jobsToRun, job)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Start the jobs after committing the transaction
+	for _, jobToRun := range jobsToRun {
+		s.jobRegistryRWLock.RLock()
+		job := s.jobRegistry[jobToRun.name]
+		s.jobRegistryRWLock.RUnlock()
+
+		s.incrementRunningJobs()
+		go s.runJob(jobToRun.name, jobToRun.key, job, jobToRun.parameters, jobToRun.retries)
+	}
+
+	return nil
+}
+func (s *Scheduler) runJob(name string, key string, job Job, parameters json.RawMessage, retries int) {
+	defer s.decrementRunningJobs()
+
+	startTime := s.clock.Now().UTC()
+
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+
+	// Store cancel function in a map for external cancellation
+	cancelKey := getCancelKey(name, key)
+	s.cancelFuncs.Store(cancelKey, cancel)
+	defer s.cancelFuncs.Delete(cancelKey)
+
+	defer func() {
+		if p := recover(); p != nil {
+			if err, ok := p.(error); ok {
+				s.config.Logger.Error("job panic", "job", name, "key", key, "error", err, "stack", string(debug.Stack()))
+			} else {
+				s.config.Logger.Error("job panic", "job", name, "key", key, "panic", p, "stack", string(debug.Stack()))
+			}
+			s.markJobFailed(name, key, job, s.clock.Since(startTime))
+		}
+	}()
+
+	s.config.Logger.Debug("running job", "job", name, "key", key, "time", startTime)
+
+	// Start heartbeat
+	stopHeartbeat := make(chan struct{})
+	s.wg.Add(1)
+	defer close(stopHeartbeat)
+	defer s.wg.Done()
+	go s.updateHeartbeat(name, key, stopHeartbeat)
+
+	// Setup parameters if any
+	if len(parameters) > 0 {
+		var params interface{}
+		if err := json.Unmarshal(parameters, &params); err != nil {
+			s.config.Logger.Error("error unmarshalling job parameters", "job", name, "key", key, "error", err)
+			s.markJobFailed(name, key, job, s.clock.Since(startTime))
+			return
+		}
+		ctx = context.WithValue(ctx, ClusterSchedulerParametersKey, params)
+	}
+
+	// Run the job
+	if err := job.Run(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.markJobCancelled(name, key)
+		} else {
+			s.config.Logger.Error("job failed", "job", name, "key", key, "error", err)
+			s.markJobFailed(name, key, job, s.clock.Since(startTime))
+		}
+		return
+	}
+
+	s.markJobSucceeded(name, key, job, s.clock.Since(startTime))
+}
+
+func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.Duration) {
+	parameters, err := json.Marshal(job.Parameters())
+	if err != nil {
+		s.config.Logger.Error("failed to marshal job parameters", "job", name, "error", err)
+		parameters = nil
+	}
+
+	// Get current retries from database
+	var currentRetries int
+	query := fmt.Sprintf(`
+        SELECT retries 
+        FROM %s 
+        WHERE name = $1 AND key = $2`, s.tableName)
+	err = s.db.QueryRow(query, name, key).Scan(&currentRetries)
+	if err != nil {
+		s.config.Logger.Error("failed to get current retries", "job", name, "key", key, "error", err)
+		return
+	}
+
+	nowUTC := s.clock.Now().UTC()
+	var nextRun *time.Time
+	var status Status
+	var newRetries int
+
+	if currentRetries > 0 {
+		// Still have retries left
+		next := nowUTC.Add(s.config.JobCheckInterval) // Retry after interval
+		nextRun = &next
+		status = StatusPending
+		newRetries = currentRetries - 1
+	} else if calculator := job.NextRunCalculator(); calculator != nil {
+		// No retries left but job is recurring
+		if next, err := calculator.NextRun(nowUTC); err == nil {
+			nextRun = &next
+			status = StatusPending
+			newRetries = job.MaxRetries() // Reset retries for next run
+		} else {
+			s.config.Logger.Error("failed to calculate next run", "job", name, "error", err)
+			return
+		}
+	} else {
+		// No retries left and not recurring
+		status = StatusFailed
+		newRetries = 0
+	}
+
+	query = fmt.Sprintf(`
+        UPDATE %s 
+        SET picked = false, 
+            picked_by = $1,
+            next_run = $2,
+            status = $3,
+            execution_time = $4,
+            last_failure = $5,
+            consecutive_failures = consecutive_failures + 1,
+            parameters = $6,
+            retries = $7
+        WHERE name = $8 AND key = $9`, s.tableName)
+
+	_, err = s.db.Exec(query,
+		uuid.Nil,
+		nextRun,
+		status,
+		sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true},
+		sql.NullTime{Time: nowUTC, Valid: true},
+		parameters,
+		newRetries,
+		name,
+		key)
+
+	if err != nil {
+		s.config.Logger.Error("failed to mark job as failed", "job", name, "error", err)
+	}
+}
+
+func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime time.Duration) {
+	parameters, err := json.Marshal(job.Parameters())
+	if err != nil {
+		s.config.Logger.Error("failed to marshal job parameters", "job", name, "error", err)
+		parameters = nil
+	}
+
+	nowUTC := s.clock.Now().UTC()
+	var nextRun *time.Time
+
+	if calculator := job.NextRunCalculator(); calculator != nil {
+		if next, err := calculator.NextRun(nowUTC); err == nil {
+			nextRun = &next
+		} else {
+			s.config.Logger.Error("failed to calculate next run", "job", name, "error", err)
+			return
+		}
+	}
+
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET status = $1,
+            last_run = $2,
+            picked = false,
+            picked_by = $3,
+            next_run = $4,
+            execution_time = $5,
+            last_success = $6,
+            consecutive_failures = 0,
+            parameters = $7,
+            cancel_requested = false,
+            retries = $8
+        WHERE name = $9 AND key = $10`, s.tableName)
+
+	_, err = s.db.Exec(query,
+		StatusPending,
+		nowUTC,
+		uuid.Nil,
+		nextRun,
+		sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true},
+		sql.NullTime{Time: nowUTC, Valid: true},
+		parameters,
+		job.MaxRetries(), // Reset retries on success for recurring jobs
+		name,
+		key)
+
+	if err != nil {
+		s.config.Logger.Error("failed to update job status", "job", name, "error", err)
+	}
+}
+func (s *Scheduler) markJobCancelled(name, key string) {
+	nowUTC := s.clock.Now().UTC()
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET status = $1,
+            last_run = $2,
+            picked = false,
+            picked_by = $3,
+            next_run = NULL,
+            cancel_requested = false
+        WHERE name = $4 AND key = $5`, s.tableName)
+
+	_, err := s.db.Exec(query,
+		StatusFailed,
+		nowUTC,
+		uuid.Nil,
+		name,
+		key)
+
+	if err != nil {
+		s.config.Logger.Error("failed to mark job as cancelled", "job", name, "key", key, "error", err)
+	}
+}
+
+func (s *Scheduler) CancelJob(name, key string) error {
+	// Start transaction
+	tx, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// First check if the job exists
+	var exists bool
+	existsQuery := fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM %s WHERE name = $1 AND key = $2)`, s.tableName)
+	err = tx.QueryRow(existsQuery, name, key).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check job existence: %w", err)
+	}
+	if !exists {
+		return ErrJobNotFound
+	}
+
+	// Try to mark the job for cancellation if it's running
+	query := fmt.Sprintf(`
+        UPDATE %s
+        SET cancel_requested = true
+        WHERE name = $1 AND key = $2 AND picked = true
+        RETURNING name`, s.tableName)
+
+	var returnedName string
+	err = tx.QueryRow(query, name, key).Scan(&returnedName)
+	if err == sql.ErrNoRows {
+		return ErrJobNotRunning
+	}
+	if err != nil {
+		return fmt.Errorf("failed to request job cancellation: %w", err)
+	}
+
+	// If PGLN is configured, add notification to transaction
+	if s.config.PGLNInstance != nil {
+		cancelInfo := struct {
+			Name string `json:"name"`
+			Key  string `json:"key"`
+		}{
+			Name: name,
+			Key:  key,
+		}
+		payload, err := json.Marshal(cancelInfo)
+		if err != nil {
+			return fmt.Errorf("failed to marshal cancel notification: %w", err)
+		}
+
+		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notifyChannelJobCancel, string(payload))
+		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		if err != nil {
+			return fmt.Errorf("failed to add notification to transaction: %w", err)
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Check if the job is running on this node and cancel it
+	cancelKey := getCancelKey(name, key)
+	if cancel, ok := s.cancelFuncs.Load(cancelKey); ok {
+		cancel.(context.CancelFunc)()
+	}
+
+	return nil
+}
+
+func (s *Scheduler) startCancelMonitor() {
+	defer s.wg.Done()
+	ticker := s.clock.NewTicker(s.config.CancelCheckPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.Chan():
+			s.checkForCancellations()
+		case <-s.shutdownChan:
+			return
+		}
+	}
+}
+
+func (s *Scheduler) checkForCancellations() {
+	query := fmt.Sprintf(`
+        SELECT name, key 
+        FROM %s 
+        WHERE picked = true 
+        AND status = $1
+        AND cancel_requested = true
+        AND picked_by = $2`, s.tableName)
+
+	var jobs []struct {
+		Name string
+		Key  string
+	}
+	err := s.db.Select(&jobs, query, StatusRunning, s.nodeID)
+	if err != nil {
+		s.config.Logger.Error("failed to check for cancelled jobs", "error", err)
+		return
+	}
+
+	for _, job := range jobs {
+		cancelKey := getCancelKey(job.Name, job.Key)
+		if cancel, ok := s.cancelFuncs.Load(cancelKey); ok {
+			cancel.(context.CancelFunc)()
+		}
+	}
+}
+
+func (s *Scheduler) updateHeartbeat(name, key string, stop chan struct{}) {
+	ticker := s.clock.NewTicker(s.config.HeartbeatInterval)
+	defer ticker.Stop()
+
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET heartbeat = $1 
+        WHERE name = $2 
+        AND key = $3
+        AND picked_by = $4`, s.tableName)
+
+	for {
+		select {
+		case <-ticker.Chan():
+			_, err := s.db.Exec(query,
+				s.clock.Now().UTC(),
+				name,
+				key,
+				s.nodeID)
+			if err != nil {
+				s.config.Logger.Error("failed to update heartbeat", "job", name, "key", key, "error", err)
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (s *Scheduler) startHeartbeatMonitor() {
+	defer s.wg.Done()
+	ticker := s.clock.NewTicker(s.config.NoHeartbeatTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.Chan():
+			if err := s.checkAndResetTimedOutJobs(); err != nil {
+				s.config.Logger.Error("error checking and resetting timed out jobs", "error", err)
+			}
+		case <-s.shutdownChan:
+			return
+		}
+	}
+}
+
+func (s *Scheduler) checkAndResetTimedOutJobs() error {
+	query := fmt.Sprintf(`
+        UPDATE %s
+        SET picked = false, 
+            picked_by = $1, 
+            next_run = $2,
+            status = $3
+        WHERE picked = true 
+        AND heartbeat < $4
+        RETURNING name, key`, s.tableName)
+
+	var jobs []struct {
+		Name string
+		Key  string
+	}
+	err := s.db.Select(&jobs, query,
+		uuid.Nil,
+		s.clock.Now().UTC(),
+		StatusPending,
+		s.clock.Now().UTC().Add(-s.config.NoHeartbeatTimeout))
+
+	if err != nil {
+		return fmt.Errorf("failed to reset timed-out jobs: %w", err)
+	}
+
+	for _, job := range jobs {
+		s.config.Logger.Debug("reset timed-out job", "job", job.Name, "key", job.Key)
+	}
+
+	return nil
+}
+
+func (s *Scheduler) startFailedAndCompletedJobCleaner() {
+	defer s.wg.Done()
+	ticker := s.clock.NewTicker(s.config.FailedAndCompletedJobCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.Chan():
+			if err := s.cleanFailedAndCompletedJobs(); err != nil {
+				s.config.Logger.Error("error cleaning failed and completed jobs", "error", err)
+			}
+		case <-s.shutdownChan:
+			return
+		}
+	}
+}
+
+func (s *Scheduler) cleanFailedAndCompletedJobs() error {
+	query := fmt.Sprintf(`
+        DELETE FROM %s 
+        WHERE next_run IS NULL 
+        AND status IN ($1, $2) 
+        AND last_run < $3`,
+		s.tableName)
+
+	_, err := s.db.Exec(query,
+		StatusFailed,
+		StatusCompleted,
+		s.clock.Now().UTC().Add(-s.config.FailedAndCompletedJobCleanupInterval))
+
+	if err != nil {
+		return fmt.Errorf("failed to clean failed and completed jobs: %w", err)
+	}
+	return nil
 }
 
 func (s *Scheduler) startOrphanedJobMonitor() {
@@ -530,18 +1140,21 @@ func (s *Scheduler) startOrphanedJobMonitor() {
 }
 
 func (s *Scheduler) cleanOrphanedJobs() error {
-	jobRegistryRWLock.RLock()
-	jobNames := make([]string, 0, len(jobRegistry))
-	for name := range jobRegistry {
+	s.jobRegistryRWLock.RLock()
+	jobNames := make([]string, 0, len(s.jobRegistry))
+	for name := range s.jobRegistry {
 		jobNames = append(jobNames, name)
 	}
-	jobRegistryRWLock.RUnlock()
+	s.jobRegistryRWLock.RUnlock()
+
+	if len(jobNames) == 0 {
+		return nil
+	}
 
 	query := fmt.Sprintf(`
         DELETE FROM %s
-        WHERE "name" NOT IN (?)
-        AND "heartbeat" < ?
-    `, s.tableName)
+        WHERE name NOT IN (?)
+        AND heartbeat < ?`, s.tableName)
 
 	query, args, err := sqlx.In(query, jobNames, s.clock.Now().UTC().Add(-s.config.OrphanedJobTimeout))
 	if err != nil {
@@ -549,324 +1162,14 @@ func (s *Scheduler) cleanOrphanedJobs() error {
 	}
 
 	query = s.db.Rebind(query)
-
-	result, err := s.config.DB.Exec(query, args...)
+	result, err := s.db.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to clean orphaned jobs: %w", err)
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		s.config.Logger.Error("failed to get rows affected", "error", err)
-	} else if rowsAffected > 0 {
+	if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected > 0 {
 		s.config.Logger.Info("cleaned orphaned jobs", "count", rowsAffected)
 	}
 
 	return nil
-}
-
-func (s *Scheduler) startHeartbeatMonitorForOneTimeJobs() {
-	defer s.wg.Done()
-	ticker := s.clock.NewTicker(s.config.NoHeartbeatTimeout)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.Chan():
-			if err := s.checkAndResetTimedOutJobs(); err != nil {
-				s.config.Logger.Error("error checking and resetting timed out jobs", "error", err)
-			}
-		case <-s.shutdownChan:
-			return
-		}
-	}
-}
-
-func (s *Scheduler) startFailedAndCompletedOneTimeJobCleaner() {
-	defer s.wg.Done()
-	ticker := s.clock.NewTicker(s.config.FailedAndCompletedOneTimeJobInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.Chan():
-			if err := s.cleanFailedAndCompletedOneTimeJobs(); err != nil {
-				s.config.Logger.Error("error cleaning failed one-time jobs", "error", err)
-			}
-		case <-s.shutdownChan:
-			return
-		}
-	}
-}
-
-func (s *Scheduler) cleanFailedAndCompletedOneTimeJobs() error {
-	query := fmt.Sprintf(`DELETE FROM %s WHERE "job_type" = $1 AND ("status" = $2 OR "status" = $3)`, s.tableName)
-	_, err := s.config.DB.Exec(query, JobTypeOneTime, statusFailed, statusCompleted)
-	if err != nil {
-		return fmt.Errorf("failed to clean failed one-time jobs: %w", err)
-	}
-	return nil
-}
-
-func (s *Scheduler) processJobs() error {
-	var wg sync.WaitGroup
-	var errRecurring error
-	var errOneTime error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := s.acquireLockAndRun(JobTypeRecurring, s.config.MaxConcurrentRecurringJobs); err != nil {
-			errRecurring = fmt.Errorf("error acquiring lock and running jobs of type %d: %w", JobTypeRecurring, err)
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := s.acquireLockAndRun(JobTypeOneTime, s.config.MaxConcurrentOneTimeJobs); err != nil {
-			errOneTime = fmt.Errorf("error acquiring lock and running jobs of type %d: %w", JobTypeOneTime, err)
-		}
-	}()
-	wg.Wait()
-	if errRecurring != nil && errOneTime == nil {
-		return errRecurring
-	} else if errRecurring == nil && errOneTime != nil {
-		return errOneTime
-	} else if errRecurring != nil && errOneTime != nil {
-		return errors.Join(errRecurring, errOneTime)
-	}
-	return nil
-}
-
-func (s *Scheduler) acquireLockAndRun(jobType JobType, quota int) error {
-	tx, err := s.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	jobRegistryRWLock.RLock()
-	jobNames := make([]string, 0, len(jobRegistry))
-	for name := range jobRegistry {
-		jobNames = append(jobNames, name)
-	}
-	jobRegistryRWLock.RUnlock()
-
-	query := fmt.Sprintf(`SELECT "key", "name", "last_run", "picked", "picked_by", "heartbeat", "next_run", "job_type", "parameters", "status", "retries", "execution_time", "last_success", "last_failure", "consecutive_failures"
-		FROM %s 
-		WHERE "job_type" = ?
-		  AND "name" IN (?)
-		  AND "picked" = false 
-		  AND "next_run" <= ?
-		ORDER BY "next_run" 
-		LIMIT ?
-		FOR UPDATE`, s.tableName)
-
-	query, args, err := sqlx.In(query, jobType, jobNames, s.clock.Now().UTC(), quota)
-	if err != nil {
-		return fmt.Errorf("failed to expand IN clause: %w", err)
-	}
-
-	query = tx.Rebind(query)
-
-	var jobRecords []jobRecord
-	err = tx.Select(&jobRecords, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to select jobs: %w", err)
-	}
-
-	for _, job := range jobRecords {
-		updateQuery := fmt.Sprintf(`UPDATE %s SET "picked" = ?, "picked_by" = ?, "heartbeat" = ?, "status" = ? WHERE "key" = ?`, s.tableName)
-		updateQuery = tx.Rebind(updateQuery)
-		_, err := tx.Exec(updateQuery, true, s.nodeID, s.clock.Now().UTC(), statusRunning, job.Key)
-		if err != nil {
-			return fmt.Errorf("failed to pick job: %w", err)
-		}
-		s.runningJobs.Store(job.Key, true)
-		go s.runJob(job.Key, jobRegistry[job.Name], job.Parameters, job.Retries)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Scheduler) recoverLogAndFail(msg string, jobKey string, job Job, retries int, startTime time.Time) {
-	if p := recover(); p != nil {
-		if err, ok := p.(error); ok {
-			s.config.Logger.Error(msg+": %w, stack: %s", err, string(debug.Stack()))
-		} else {
-			s.config.Logger.Error(msg+": %v, stack: %s", p, string(debug.Stack()))
-		}
-		s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
-	}
-}
-
-func (s *Scheduler) runJob(jobKey string, job Job, parameters json.RawMessage, retries int) {
-	defer s.runningJobs.Delete(jobKey)
-	startTime := s.clock.Now().UTC()
-	defer s.recoverLogAndFail(fmt.Sprintf("failed to run job - %s", jobKey), jobKey, job, retries, startTime)
-
-	s.config.Logger.Debug("running job", "job", jobKey, "time", startTime)
-	ctx := s.ctx
-
-	stopHeartbeat := make(chan struct{})
-	s.wg.Add(1)
-	defer close(stopHeartbeat)
-	defer s.wg.Done()
-	go s.updateHeartbeat(jobKey, stopHeartbeat)
-
-	var err error
-	if job.JobType() == JobTypeOneTime {
-		var params interface{}
-		err = json.Unmarshal(parameters, &params)
-		if err != nil {
-			s.config.Logger.Error("error unmarshalling job parameters", "job", jobKey, "error", err)
-			s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
-			return
-		}
-		ctx = context.WithValue(s.ctx, ClusterSchedulerParametersKey, params)
-	}
-
-	err = job.Run(ctx)
-	if err != nil {
-		s.config.Logger.Error("error running job", "job", jobKey, "error", err)
-		s.markJobFailed(jobKey, job, retries, s.clock.Now().UTC().Sub(startTime))
-		return
-	}
-
-	s.markJobSucceeded(jobKey, job, s.clock.Now().UTC().Sub(startTime))
-}
-
-func (s *Scheduler) markJobFailed(jobKey string, job Job, retries int, executionTime time.Duration) {
-	if job.JobType() == JobTypeOneTime && retries > 0 {
-		nextRun := s.clock.Now().UTC().Add(s.config.JobCheckInterval)
-		query := fmt.Sprintf(`
-			UPDATE %s 
-			SET "picked" = false, "status" = $1, "next_run" = $2, "retries" = $3, 
-				"execution_time" = $4, "last_failure" = $5, 
-				"consecutive_failures" = "consecutive_failures" + 1
-			WHERE "key" = $6`, s.tableName)
-		_, err := s.config.DB.Exec(query, statusPending, nextRun, retries-1, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
-		if err != nil {
-			s.config.Logger.Error("failed to mark one-time job for retry", "job", jobKey, "error", err)
-		}
-	} else if job.JobType() == JobTypeOneTime {
-		// For one-time jobs with no retries left, set next_run to max time
-		maxTime := time.Unix(1<<63-62135596801, 999999999)
-		query := fmt.Sprintf(`
-			UPDATE %s 
-			SET "picked" = false, "status" = $1, "next_run" = $2, "execution_time" = $3, 
-				"last_failure" = $4, "consecutive_failures" = "consecutive_failures" + 1
-			WHERE "key" = $5`, s.tableName)
-		_, err := s.config.DB.Exec(query, statusFailed, maxTime, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
-		if err != nil {
-			s.config.Logger.Error("failed to mark one-time job as failed", "job", jobKey, "error", err)
-		}
-	} else {
-		nextRun, err := s.calculateNextRun(job.CronSchedule())
-		if err != nil {
-			s.config.Logger.Error("failed to calculate next run", "job", jobKey, "error", err)
-			return
-		}
-		query := fmt.Sprintf(`
-			UPDATE %s 
-			SET "picked" = false, "picked_by" = $1, "next_run" = $2, "status" = $3, "execution_time" = $4, 
-				"last_failure" = $5, "consecutive_failures" = "consecutive_failures" + 1
-			WHERE "key" = $6`, s.tableName)
-		_, err = s.config.DB.Exec(query, uuid.Nil, nextRun, statusFailed, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
-		if err != nil {
-			s.config.Logger.Error("failed to mark job as failed", "job", jobKey, "error", err)
-		}
-	}
-}
-
-func (s *Scheduler) markJobSucceeded(jobKey string, job Job, executionTime time.Duration) {
-	if job.JobType() == JobTypeOneTime {
-		query := fmt.Sprintf(`
-			UPDATE %s 
-			SET "status" = $1, "execution_time" = $2, 
-				"last_success" = $3, "consecutive_failures" = 0
-			WHERE "key" = $4`, s.tableName)
-		_, err := s.config.DB.Exec(query, statusCompleted, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
-		if err != nil {
-			s.config.Logger.Error("failed to mark one-time job as completed", "job", jobKey, "error", err)
-		}
-	} else {
-		nextRun, err := s.calculateNextRun(job.CronSchedule())
-		if err != nil {
-			s.config.Logger.Error("failed to calculate next run", "job", jobKey, "error", err)
-			return
-		}
-		query := fmt.Sprintf(`
-			UPDATE %s 
-			SET "status" = $1, "last_run" = $2, "picked" = false, 
-				"picked_by" = $3, "next_run" = $4, "execution_time" = $5, 
-				"last_success" = $6, "consecutive_failures" = 0
-			WHERE "key" = $7`, s.tableName)
-		_, err = s.config.DB.Exec(query, statusPending, s.clock.Now().UTC(), uuid.Nil, nextRun, sql.NullInt64{Int64: executionTime.Milliseconds(), Valid: true}, sql.NullTime{Time: s.clock.Now().UTC(), Valid: true}, jobKey)
-		if err != nil {
-			s.config.Logger.Error("failed to update recurring job", "job", jobKey, "error", err)
-		}
-	}
-}
-
-func (s *Scheduler) checkAndResetTimedOutJobs() error {
-	query := fmt.Sprintf(`
-		UPDATE %s
-		SET "picked" = false, "picked_by" = $1, "next_run" = $2, "status" = $3, 
-			"retries" = CASE WHEN "job_type" = $4 THEN "retries" - 1 ELSE "retries" END
-		WHERE "picked" = true AND "heartbeat" < $5 AND ("job_type" = $4 AND "retries" > 0)
-		RETURNING "key", "name", "job_type", "retries"`, s.tableName)
-
-	var resetJobs []struct {
-		Key     string
-		Name    string
-		JobType JobType `db:"job_type"`
-		Retries int
-	}
-	err := s.db.Select(&resetJobs, query, uuid.Nil, s.clock.Now().UTC(), statusPending, JobTypeOneTime, s.clock.Now().UTC().Add(-s.config.NoHeartbeatTimeout))
-	if err != nil {
-		return fmt.Errorf("failed to reset timed-out jobs: %w", err)
-	}
-
-	for _, job := range resetJobs {
-		s.config.Logger.Debug("reset timed-out job", "job", job.Name, "key", job.Key, "type", job.JobType, "retries_left", job.Retries)
-		if job.JobType == JobTypeOneTime && job.Retries <= 0 {
-			if err := s.removeJob(job.Key); err != nil {
-				s.config.Logger.Error("failed to remove exhausted one-time job", "job", job.Name, "key", job.Key, "error", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *Scheduler) removeJob(jobKey string) error {
-	query := fmt.Sprintf(`DELETE FROM %s WHERE "key" = $1`, s.tableName)
-	_, err := s.config.DB.Exec(query, jobKey)
-	if err != nil {
-		return fmt.Errorf("failed to delete job: %w", err)
-	}
-	return nil
-}
-
-func (s *Scheduler) updateHeartbeat(jobKey string, stop chan struct{}) {
-	ticker := s.clock.NewTicker(s.config.HeartbeatInterval)
-	defer ticker.Stop()
-	query := fmt.Sprintf(`UPDATE %s SET "heartbeat" = $1 WHERE "key" = $2 AND "picked_by" = $3`, s.tableName)
-	for {
-		select {
-		case <-ticker.Chan():
-			_, err := s.config.DB.Exec(query, s.clock.Now().UTC(), jobKey, s.nodeID)
-			if err != nil {
-				s.config.Logger.Error("failed to update heartbeat", "job", jobKey, "error", err)
-			}
-		case <-stop:
-			return
-		}
-	}
 }

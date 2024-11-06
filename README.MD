@@ -9,19 +9,29 @@ If you find this project useful, please consider giving it a star ⭐️ on GitH
 ## Features
 
 - Support for recurring (cron-based) and one-time jobs
-- Ensures only one instance of a job runs at the same time across distributed nodes
+- Ensures only one instance of a job runs at a time across distributed nodes
 - Automatic retries for failed jobs
 - Heartbeat monitoring to detect and reset stalled jobs
 - Orphaned job cleanup (delayed, to support rollbacks)
 - Configurable node job concurrency limits
 - Support for both `lib/pq` and `jackc/pgx` or any other database/sql based drivers
 - Custom schema support for job tables
+- Optional PGLN integration for improved responsiveness
+- Support for job-specific keys to allow multiple instances of the same job type
 
 ### Distributed Execution
 
 PGScheduler ensures that only one instance of a job runs at a time across distributed nodes. This is achieved through a locking mechanism in the database. When a node picks up a job to run, it sets a lock in the database. Other nodes will see this lock and skip the job, preventing multiple executions of the same job across different nodes.
 
-This feature is particularly useful in distributed environments where you have multiple instances of your application running, each with its own scheduler. It prevents job duplication and ensures consistent execution of recurring tasks.
+### PGLN Integration
+
+PGScheduler optionally integrates with PGLN (PostgreSQL Listen/Notify) to provide immediate responsiveness for job scheduling and cancellation. When enabled:
+
+- Jobs start processing immediately upon scheduling
+- Job cancellations are processed instantly
+- Maintains polling as a fallback mechanism for reliability
+- Automatic recovery of missed events during disconnections
+- Transactional notifications ensure consistency
 
 ## Installation
 
@@ -31,17 +41,57 @@ To install PGScheduler, use `go get`:
 go get github.com/tzahifadida/go-pg-scheduler
 ```
 
-## Configuration
+### Optional PGLN Dependency
 
-PGScheduler is highly configurable. Here's an explanation of the `SchedulerConfig` struct:
+If you want to use the PGLN integration for improved responsiveness:
+
+```bash
+go get github.com/tzahifadida/pgln
+```
+
+## Job Interface
+
+To create a job, implement the `Job` interface:
+
+```go
+type Job interface {
+    Name() string
+    Key() string
+    Run(ctx context.Context) error
+    NextRunCalculator() NextRunCalculator
+    Parameters() interface{}
+    MaxRetries() int
+}
+```
+
+The interface includes:
+- `Name()`: Returns the job type identifier
+- `Key()`: Returns a unique key for this job instance
+- `Run()`: Contains the job's execution logic
+- `NextRunCalculator()`: Defines when the job should run next (cron or interval)
+- `Parameters()`: Provides job-specific parameters
+- `MaxRetries()`: Specifies maximum retry attempts on failure
+
+### NextRunCalculator Interface
+
+```go
+type NextRunCalculator interface {
+    NextRun(now time.Time) (time.Time, error)
+}
+```
+
+PGScheduler provides two implementations:
+- `CronSchedule`: For cron-based scheduling
+- `FixedInterval`: For interval-based scheduling
+
+## Configuration
 
 ```go
 type SchedulerConfig struct {
     Ctx                                  context.Context
     DB                                   *sql.DB
     DBDriverName                         string
-    MaxConcurrentOneTimeJobs             int
-    MaxConcurrentRecurringJobs           int
+    MaxRunningJobs                       int
     JobCheckInterval                     time.Duration
     OrphanedJobTimeout                   time.Duration
     HeartbeatInterval                    time.Duration
@@ -51,155 +101,16 @@ type SchedulerConfig struct {
     RunImmediately                       bool
     TablePrefix                          string
     ShutdownTimeout                      time.Duration
-    FailedAndCompletedOneTimeJobInterval time.Duration
+    FailedAndCompletedJobCleanupInterval time.Duration
+    CancelCheckPeriod                    time.Duration
     Schema                               string
+    PGLNInstance                         *pgln.PGListenNotify // Optional PGLN instance
 }
 ```
 
-- `Ctx`: The context for the scheduler. If not provided, a background context will be used.
-- `DB`: A `*sql.DB` instance for database operations.
-- `DBDriverName`: The name of the database driver ("postgres" for `lib/pq`, "pgx" for `jackc/pgx`).
-- `MaxConcurrentOneTimeJobs`: The maximum number of one-time jobs that can run concurrently.
-- `MaxConcurrentRecurringJobs`: The maximum number of recurring jobs that can run concurrently.
-- `JobCheckInterval`: How often to check for new jobs to run.
-- `OrphanedJobTimeout`: The duration after which a job is considered orphaned (default: 14 days).
-- `HeartbeatInterval`: How often to update the heartbeat for running jobs.
-- `NoHeartbeatTimeout`: The duration after which a job with no heartbeat is considered failed.
-- `CreateSchema`: Whether to automatically create the required database schema.
-- `Logger`: A `Logger` interface instance for logging.
-- `RunImmediately`: Whether to run jobs immediately upon scheduler start.
-- `TablePrefix`: A prefix for the database table name.
-- `ShutdownTimeout`: The maximum duration to wait for jobs to complete during shutdown.
-- `FailedAndCompletedOneTimeJobInterval`: How often to clean up failed and completed one-time jobs.
-- `Schema`: The PostgreSQL schema to use for the job tables (default: "public").
+## Usage Examples
 
-## Usage
-
-### Creating a Scheduler
-
-```go
-import (
-    "database/sql"
-    "github.com/tzahifadida/go-pg-scheduler"
-    _ "github.com/lib/pq"
-)
-
-func main() {
-    db, err := sql.Open("postgres", "your_connection_string")
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
-
-    config := pgscheduler.SchedulerConfig{
-        DB:                db,
-        DBDriverName:      "postgres",
-        JobCheckInterval:  time.Minute,
-        CreateSchema:      true,
-        Schema:            "custom_schema", // Optional: specify a custom schema
-    }
-
-    scheduler, err := pgscheduler.NewScheduler(config)
-    if err != nil {
-        panic(err)
-    }
-
-    // also creates the schema if missing
-    err = scheduler.Init()
-    if err != nil {
-        panic(err)
-    }
-    // call ScheduleJob here if you specified RunImmediately = true
-
-    // starts job processing
-    err = scheduler.Start()
-    if err != nil {
-        panic(err)
-    }
-    // call ScheduleJob here
-
-    scheduler.Shutdown()
-}
-```
-
-### Defining Jobs
-
-To create a job, implement the `Job` interface:
-
-```go
-type Job interface {
-    Name() string
-    CronSchedule() string
-    JobType() JobType
-    Parameters() interface{}
-    Retries() int
-    Run(ctx context.Context) error
-}
-```
-
-### Recurring Job Example
-
-```go
-type MyRecurringJob struct {
-    pgscheduler.JobConfig
-}
-
-func (j *MyRecurringJob) Run(ctx context.Context) error {
-    // Job logic
-    return nil
-}
-
-// Create and schedule the job
-jobConfig, err := pgscheduler.NewRecurringJobConfig("my_recurring_job", "*/5 * * * *")
-if err != nil {
-    panic(err)
-}
-
-job := &MyRecurringJob{JobConfig: *jobConfig}
-err = scheduler.ScheduleJob(job)
-if err != nil {
-    panic(err)
-}
-```
-
-### One-Time Job Example with Parameter Passing
-
-```go
-type MyOneTimeJob struct {
-    pgscheduler.JobConfig
-}
-
-func (j *MyOneTimeJob) Run(ctx context.Context) error {
-    // Retrieve parameters from context
-    params := ctx.Value(pgscheduler.ClusterSchedulerParametersKey)
-    if params != nil {
-        // Use the parameters
-        fmt.Printf("Job parameters: %v\n", params)
-    }
-    // Job logic
-    return nil
-}
-
-// Create and schedule the job
-params := map[string]interface{}{
-    "key1": "value1",
-    "key2": 42,
-}
-jobConfig, err := pgscheduler.NewOneTimeJobConfig("my_one_time_job", params, 3)
-if err != nil {
-    panic(err)
-}
-
-job := &MyOneTimeJob{JobConfig: *jobConfig}
-err = scheduler.ScheduleJob(job)
-if err != nil {
-    panic(err)
-}
-```
-
-## Database Driver Examples
-
-### Using `lib/pq`
+### Basic Scheduler Setup
 
 ```go
 import (
@@ -218,8 +129,8 @@ func main() {
     config := pgscheduler.SchedulerConfig{
         DB:           db,
         DBDriverName: "postgres",
-        Schema:       "custom_schema", // Optional: specify a custom schema
-        // ... other configuration options
+        Schema:       "custom_schema", // Optional
+        // ... other configuration
     }
 
     scheduler, err := pgscheduler.NewScheduler(config)
@@ -227,53 +138,106 @@ func main() {
         panic(err)
     }
 
-    // Use the scheduler...
+    // Initialize and start
+    if err := scheduler.Init(); err != nil {
+        panic(err)
+    }
+    if err := scheduler.Start(); err != nil {
+        panic(err)
+    }
+    defer scheduler.Shutdown()
 }
 ```
 
-### Using `jackc/pgx`
+### Setup with PGLN Integration
 
 ```go
 import (
-    "github.com/jackc/pgx/v4/stdlib"
+    "github.com/tzahifadida/pgln"
     "github.com/tzahifadida/go-pg-scheduler"
 )
 
 func main() {
-    connConfig, err := pgx.ParseConfig("postgres://user:password@localhost/dbname")
+    // Create PGLN instance
+    pglnBuilder := pgln.NewPGListenNotifyBuilder().
+        SetContext(ctx).
+        SetDB(db).
+        SetReconnectInterval(5 * time.Second)
+
+    pglnInstance, err := pglnBuilder.Build()
     if err != nil {
         panic(err)
     }
+    err = pglnInstance.Start()
+    if err != nil {
+        panic(err)
+    }
+    defer pglnInstance.Shutdown()
 
-    db := stdlib.OpenDB(*connConfig)
-    defer db.Close()
-
+    // Create scheduler with PGLN
     config := pgscheduler.SchedulerConfig{
         DB:           db,
-        DBDriverName: "pgx",
-        Schema:       "custom_schema", // Optional: specify a custom schema
-        // ... other configuration options
+        DBDriverName: "postgres",
+        PGLNInstance: pglnInstance,
+        // ... other configuration
     }
 
     scheduler, err := pgscheduler.NewScheduler(config)
-    if err != nil {
-        panic(err)
-    }
-
-    // Use the scheduler...
+    // ... rest of setup
 }
+```
+
+### Creating a Job
+
+```go
+type MyJob struct {
+    name       string
+    key        string
+    calculator pgscheduler.NextRunCalculator
+    parameters interface{}
+    maxRetries int
+}
+
+func NewMyJob(name, key string, cronExpr string) (*MyJob, error) {
+    calculator, err := pgscheduler.NewCronSchedule(cronExpr)
+    if err != nil {
+        return nil, err
+    }
+    return &MyJob{
+        name:       name,
+        key:        key,
+        calculator: calculator,
+        maxRetries: 3,
+    }, nil
+}
+
+// Implement Job interface
+func (j *MyJob) Name() string { return j.name }
+func (j *MyJob) Key() string { return j.key }
+func (j *MyJob) NextRunCalculator() pgscheduler.NextRunCalculator { return j.calculator }
+func (j *MyJob) Parameters() interface{} { return j.parameters }
+func (j *MyJob) MaxRetries() int { return j.maxRetries }
+func (j *MyJob) Run(ctx context.Context) error {
+    // Job implementation
+    return nil
+}
+
+// Register and schedule the job
+job, _ := NewMyJob("my_job", "instance_1", "*/5 * * * *")
+scheduler.RegisterJob(job)
+scheduler.ScheduleJob(job)
 ```
 
 ## Best Practices
 
-1. Always call `scheduler.Shutdown()` when your application is terminating to ensure proper cleanup.
-2. Don't create a job Name for jobs with slightly different behavior. For one time jobs you can use parameters passing instead. Excessive job "Name"s will damage performance since each job code is kept in memory with Name as key and queries use a filter such as "IN (Names...)".
-3. Use appropriate retry counts for one-time jobs to handle transient failures.
-4. Implement proper error handling in your job's `Run` method.
-5. Use the context passed to the `Run` method for cancellation and timeout handling.
-6. Keep job execution times reasonable. For long-running jobs, consider breaking them into smaller tasks.
-7. In distributed environments, be aware that only one instance of a recurring job will run at a time across all nodes.
-8. When using custom schemas, ensure that your database user has the necessary permissions to create and access the specified schema.
+1. Always call `scheduler.Shutdown()` when your application is terminating.
+2. Use unique job keys for different instances of the same job type.
+3. Consider using PGLN integration for time-sensitive operations.
+4. Keep job execution times reasonable.
+5. Use appropriate retry counts and intervals.
+6. Implement proper error handling in your job's `Run` method.
+7. Use the context passed to the `Run` method for cancellation.
+8. Consider your PostgreSQL connection pool size when setting MaxRunningJobs.
 
 ## Contributing
 

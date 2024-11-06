@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"log/slog"
 	"os"
 	"testing"
@@ -12,14 +16,13 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/jonboulle/clockwork"
 	_ "github.com/lib/pq"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 var testDB *sqlx.DB
 var testDBSQL *sql.DB
+var dsn string
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -44,7 +47,6 @@ func TestMain(m *testing.M) {
 	}
 	defer postgresContainer.Terminate(ctx)
 
-	fmt.Println("Container started, getting host and port...")
 	host, err := postgresContainer.Host(ctx)
 	if err != nil {
 		fmt.Printf("Failed to get container host: %s\n", err)
@@ -56,14 +58,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Container is running on %s:%s\n", host, port.Port())
-
-	dsn := fmt.Sprintf("host=%s port=%s user=testuser password=testpass dbname=testdb sslmode=disable", host, port.Port())
-	fmt.Printf("Connecting to database with DSN: %s\n", dsn)
+	dsn = fmt.Sprintf("host=%s port=%s user=testuser password=testpass dbname=testdb sslmode=disable", host, port.Port())
 
 	// Try to connect multiple times
 	for i := 0; i < 5; i++ {
-		testDBSQL, err = sql.Open("postgres", dsn)
+		testDBSQL, err = sql.Open("pgx", dsn)
 		if err == nil {
 			err = testDBSQL.Ping()
 			if err == nil {
@@ -73,14 +72,13 @@ func TestMain(m *testing.M) {
 		fmt.Printf("Failed to connect to database (attempt %d): %s\n", i+1, err)
 		time.Sleep(2 * time.Second)
 	}
-	err = testDBSQL.Ping()
 	if err != nil {
-		fmt.Println("Failed to ping the database")
+		fmt.Printf("Failed to connect to database after all attempts: %s\n", err)
 		os.Exit(1)
 	}
 
 	if testDBSQL == nil {
-		fmt.Println("Failed to connect to database after multiple attempts")
+		fmt.Println("Failed to connect to database")
 		os.Exit(1)
 	}
 
@@ -91,6 +89,77 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// TestJob implementation
+type TestJob struct {
+	name       string
+	key        string
+	calculator NextRunCalculator
+	params     interface{}
+	maxRetries int
+	runFunc    func(context.Context) error
+}
+
+func NewTestRecurringJob(name string, cronSchedule string) (*TestJob, error) {
+	calculator, err := NewCronSchedule(cronSchedule)
+	if err != nil {
+		return nil, err
+	}
+	return &TestJob{
+		name:       name,
+		key:        "test-key",
+		calculator: calculator,
+		maxRetries: 0,
+	}, nil
+}
+
+func NewTestRecurringJobWithKey(name string, key string, cronSchedule string) (*TestJob, error) {
+	calculator, err := NewCronSchedule(cronSchedule)
+	if err != nil {
+		return nil, err
+	}
+	return &TestJob{
+		name:       name,
+		key:        key,
+		calculator: calculator,
+		maxRetries: 0,
+	}, nil
+}
+
+func NewTestOneTimeJob(name string, key string, params interface{}, maxRetries int) (*TestJob, error) {
+	if maxRetries < 0 {
+		return nil, fmt.Errorf("retries must be non-negative")
+	}
+	return &TestJob{
+		name:       name,
+		key:        key,
+		params:     params,
+		maxRetries: maxRetries,
+	}, nil
+}
+
+func (j *TestJob) Name() string                         { return j.name }
+func (j *TestJob) Key() string                          { return j.key }
+func (j *TestJob) Parameters() interface{}              { return j.params }
+func (j *TestJob) MaxRetries() int                      { return j.maxRetries }
+func (j *TestJob) NextRunCalculator() NextRunCalculator { return j.calculator }
+func (j *TestJob) Run(ctx context.Context) error {
+	if j.runFunc != nil {
+		return j.runFunc(ctx)
+	}
+
+	value := ctx.Value("clockwork")
+	if value != nil {
+		clock := value.(clockwork.FakeClock)
+		clock.Advance(1 * time.Second)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+}
 func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.FakeClock) {
 	testLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -99,18 +168,18 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 	config := SchedulerConfig{
 		DB:                                   testDBSQL,
 		DBDriverName:                         "postgres",
-		MaxConcurrentOneTimeJobs:             5,
-		MaxConcurrentRecurringJobs:           5,
-		OrphanedJobTimeout:                   14 * 24 * time.Hour,
+		MaxRunningJobs:                       10,
 		JobCheckInterval:                     time.Second,
 		HeartbeatInterval:                    time.Second,
 		NoHeartbeatTimeout:                   3 * time.Second,
-		RunImmediately:                       true,
+		OrphanedJobTimeout:                   14 * 24 * time.Hour,
 		CreateSchema:                         true,
+		RunImmediately:                       true,
 		TablePrefix:                          "test_",
 		ShutdownTimeout:                      5 * time.Second,
 		Logger:                               testLogger,
-		FailedAndCompletedOneTimeJobInterval: time.Hour,
+		FailedAndCompletedJobCleanupInterval: time.Hour,
+		CancelCheckPeriod:                    time.Second,
 		Schema:                               schema,
 		clock:                                fakeClock,
 		Ctx:                                  ctx,
@@ -124,7 +193,7 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 	err = scheduler.Init()
 	require.NoError(t, err)
 
-	scheduler.Start()
+	err = scheduler.Start()
 	require.NoError(t, err)
 
 	return scheduler, fakeClock
@@ -132,7 +201,7 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 
 func cleanupTestDatabase(t *testing.T, scheduler *Scheduler) {
 	scheduler.Shutdown()
-	query := fmt.Sprintf(`DROP TABLE IF EXISTS "%s"."%s"`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
+	query := fmt.Sprintf(`DROP TABLE IF EXISTS "%s"."%s"`, scheduler.config.Schema, scheduler.config.TablePrefix+scheduledJobsTableName)
 	_, err := testDB.Exec(query)
 	require.NoError(t, err)
 
@@ -142,22 +211,6 @@ func cleanupTestDatabase(t *testing.T, scheduler *Scheduler) {
 		require.NoError(t, err)
 	}
 }
-
-type TestJob struct {
-	JobConfig
-}
-
-func (j *TestJob) Init(ctx context.Context) error { return nil }
-func (j *TestJob) Run(ctx context.Context) error {
-	value := ctx.Value("clockwork")
-	if value != nil {
-		clock := value.(clockwork.FakeClock)
-		clock.Advance(1 * time.Second)
-	}
-	time.Sleep(1 * time.Second)
-	return nil
-}
-func (j *TestJob) Shutdown(ctx context.Context) error { return nil }
 
 func TestNewScheduler(t *testing.T) {
 	scheduler, _ := setupTestScheduler(t, "public")
@@ -172,7 +225,6 @@ func TestNewSchedulerWithCustomSchema(t *testing.T) {
 
 	assert.Equal(t, `"custom_schema"."test_scheduled_jobs"`, scheduler.tableName)
 
-	// Verify that the custom schema was created
 	var schemaExists bool
 	query := `SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`
 	err := testDB.Get(&schemaExists, query, "custom_schema")
@@ -180,460 +232,585 @@ func TestNewSchedulerWithCustomSchema(t *testing.T) {
 	assert.True(t, schemaExists, "Custom schema should exist")
 }
 
-func TestScheduleJob(t *testing.T) {
+func TestRegisterAndScheduleJob(t *testing.T) {
 	scheduler, _ := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
-	jobConfig, err := NewRecurringJobConfig("test_job", "* * * * *")
+	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
 
-	job := &TestJob{JobConfig: *jobConfig}
+	// Try scheduling without registration first
+	err = scheduler.ScheduleJob(job)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must be registered before scheduling")
 
+	// Register the job
+	err = scheduler.RegisterJob(job)
+	assert.NoError(t, err)
+
+	// Schedule the job
 	err = scheduler.ScheduleJob(job)
 	assert.NoError(t, err)
 
 	// Verify job was added to the database
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var count int
-	err = testDB.Get(&count, query, job.Name())
+	var record JobRecord
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&record, query, job.Name(), job.Key())
 	assert.NoError(t, err)
-	assert.Equal(t, 1, count)
+	assert.Equal(t, job.Name(), record.Name)
+	assert.Equal(t, job.Key(), record.Key)
+	assert.Equal(t, epochStart, record.Heartbeat.Time.UTC())
+	assert.False(t, record.Picked)
 }
 
-func TestScheduleJobWithCustomSchema(t *testing.T) {
-	scheduler, _ := setupTestScheduler(t, "custom_schema")
+func TestScheduleDifferentJobKeys(t *testing.T) {
+	scheduler, _ := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
-	jobConfig, err := NewRecurringJobConfig("test_job", "* * * * *")
+	job1, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
 
-	job := &TestJob{JobConfig: *jobConfig}
+	job2, err := NewTestRecurringJobWithKey("test_job", "key2", "* * * * *")
+	require.NoError(t, err)
 
-	err = scheduler.ScheduleJob(job)
+	// Register the job
+	err = scheduler.RegisterJob(job1)
 	assert.NoError(t, err)
 
-	// Verify job was added to the database in the custom schema
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var count int
-	err = testDB.Get(&count, query, job.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, 1, count)
-}
-
-func TestAcquireLockAndRun(t *testing.T) {
-	scheduler, fakeClock := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	job1Config, err := NewRecurringJobConfig("test_job_1", "* * * * *")
-	require.NoError(t, err)
-	job1 := &TestJob{JobConfig: *job1Config}
-
-	job2Config, err := NewRecurringJobConfig("test_job_2", "* * * * *")
-	require.NoError(t, err)
-	job2 := &TestJob{JobConfig: *job2Config}
-
+	// Schedule both jobs
 	err = scheduler.ScheduleJob(job1)
-	require.NoError(t, err)
+	assert.NoError(t, err)
 
 	err = scheduler.ScheduleJob(job2)
-	require.NoError(t, err)
-
-	// Register the jobs
-	jobRegistry[job1.Name()] = job1
-	jobRegistry[job2.Name()] = job2
-
-	// Advance clock to trigger jobs
-	fakeClock.Advance(time.Minute)
-
-	// Run acquireLockAndRun
-	err = scheduler.acquireLockAndRun(JobTypeRecurring, 2)
 	assert.NoError(t, err)
-	// Verify jobs were picked
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "picked" = true OR last_success is not null`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var pickedCount int
-	err = testDB.Get(&pickedCount, query)
+
+	// Verify both jobs were added to the database
+	var count int
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1`, scheduler.tableName)
+	err = testDB.Get(&count, query, job1.Name())
 	assert.NoError(t, err)
-	assert.Equal(t, 2, pickedCount)
+	assert.Equal(t, 2, count, "Should have two jobs with different keys")
 }
 
-func TestCheckAndResetTimedOutJobs(t *testing.T) {
+func TestRegisterDuplicateJob(t *testing.T) {
+	scheduler, _ := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
+	require.NoError(t, err)
+
+	// Register the job first time
+	err = scheduler.RegisterJob(job)
+	assert.NoError(t, err)
+
+	// Try to register the same job again
+	err = scheduler.RegisterJob(job)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "already registered")
+}
+
+func TestJobExecution(t *testing.T) {
 	scheduler, fakeClock := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
-	// Insert a job that has timed out
-	query := fmt.Sprintf(`
-		INSERT INTO "%s"."%s" ("key", "name", "picked", "picked_by", "heartbeat", "job_type", "retries", "status", "next_run")
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	_, err := testDB.Exec(query, "test_job_key", "test_job", true, scheduler.nodeID, fakeClock.Now().UTC().Add(-5*time.Minute), JobTypeOneTime, 2, statusRunning, fakeClock.Now().UTC())
+	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
 
-	// Advance clock to trigger timeout
-	fakeClock.Advance(scheduler.config.NoHeartbeatTimeout + time.Second)
+	// Register and schedule the job
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(job)
+	require.NoError(t, err)
 
-	err = scheduler.checkAndResetTimedOutJobs()
-	assert.NoError(t, err)
+	// Advance clock to trigger job execution
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow for job processing
+
+	// Verify job execution
+	var record JobRecord
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&record, query, job.Name(), job.Key())
+	require.NoError(t, err)
+
+	assert.False(t, record.Picked)
+	assert.True(t, record.LastSuccess.Valid)
+	assert.True(t, record.ExecutionTime.Valid)
+	assert.Greater(t, record.ExecutionTime.Int64, int64(0))
+	assert.Equal(t, StatusPending, record.Status)
+}
+func TestRetryLogic(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	// Create a job with retry
+	maxRetries := 2
+	failingJob := &TestJob{
+		name:       "retry_job",
+		key:        "key1",
+		maxRetries: maxRetries,
+		calculator: nil,
+		runFunc: func(ctx context.Context) error {
+			return fmt.Errorf("simulated failure")
+		},
+	}
+
+	// Register and schedule the job
+	err := scheduler.RegisterJob(failingJob)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(failingJob)
+	require.NoError(t, err)
+
+	// Run and wait for all retries to complete
+	fakeClock.Advance(time.Minute)
+
+	// Wait for the job to reach final failed state with retries exhausted
+	var record JobRecord
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+
+	// Poll until the job reaches its final state or timeout
+	deadline := time.Now().Add(10 * time.Second)
+	var finalState bool
+	for time.Now().Before(deadline) {
+		err = testDB.Get(&record, query, failingJob.Name(), failingJob.Key())
+		require.NoError(t, err)
+
+		if record.Status == StatusFailed && record.Retries == 0 {
+			finalState = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		fakeClock.Advance(scheduler.config.JobCheckInterval)
+	}
+
+	// Verify the job eventually failed
+	assert.True(t, finalState, "Job should have reached failed state with retries exhausted")
+	assert.Equal(t, StatusFailed, record.Status)
+	assert.Equal(t, 0, record.Retries)
+	assert.True(t, record.LastFailure.Valid)
+	assert.Greater(t, record.ConsecutiveFailures, 0)
+	assert.False(t, record.Picked)
+}
+
+func TestJobCancellation(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	longRunningJob := &TestJob{
+		name:       "long_job",
+		key:        "key1",
+		maxRetries: 0,
+		runFunc: func(ctx context.Context) error {
+			timer := time.NewTimer(15 * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+	}
+
+	// Register and schedule the job
+	err := scheduler.RegisterJob(longRunningJob)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(longRunningJob)
+	require.NoError(t, err)
+
+	// Start the job
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow job to start
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow job to start
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow job to start
+
+	// Verify job is running
+	var record JobRecord
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+	assert.Equal(t, StatusRunning, record.Status)
+
+	// error already running
+	err = scheduler.ScheduleJob(longRunningJob)
+	require.Equal(t, err, ErrJobRunning)
+
+	// Cancel the job
+	err = scheduler.CancelJob(longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+
+	// Wait for cancellation to take effect
+	time.Sleep(2 * time.Second)
+
+	// Verify job was cancelled
+	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+	assert.Equal(t, StatusFailed, record.Status)
+	assert.False(t, record.Picked)
+	assert.True(t, record.NextRun == nil)
+	assert.False(t, record.CancelRequested)
+}
+
+func TestConcurrentJobProcessing(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	// Create multiple jobs
+	jobCount := 5
+	for i := 0; i < jobCount; i++ {
+		job, err := NewTestRecurringJobWithKey(
+			fmt.Sprintf("job_%d", i),
+			fmt.Sprintf("key_%d", i),
+			"* * * * *",
+		)
+		require.NoError(t, err)
+
+		err = scheduler.RegisterJob(job)
+		require.NoError(t, err)
+		err = scheduler.ScheduleJob(job)
+		require.NoError(t, err)
+	}
+
+	// Trigger job execution
+	fakeClock.Advance(time.Minute)
+	time.Sleep(3 * time.Second) // Allow for concurrent processing
+
+	// Verify all jobs were executed
+	query := fmt.Sprintf(`
+        SELECT COUNT(*) 
+        FROM %s 
+        WHERE last_success IS NOT NULL`, scheduler.tableName)
+
+	var completedCount int
+	err := testDB.Get(&completedCount, query)
+	require.NoError(t, err)
+	assert.Equal(t, jobCount, completedCount)
+
+	// Verify running jobs count is back to zero
+	assert.Equal(t, int64(0), scheduler.getRunningJobsCount())
+}
+
+func TestCancelNonExistentJob(t *testing.T) {
+	scheduler, _ := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	err := scheduler.CancelJob("non_existent", "key1")
+	assert.Error(t, err)
+	assert.Equal(t, ErrJobNotFound, err)
+}
+
+func TestCancelRunningJobFromDifferentNode(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	longRunningJob := &TestJob{
+		name:       "long_job",
+		key:        "key1",
+		maxRetries: 0,
+		runFunc: func(ctx context.Context) error {
+			timer := time.NewTimer(10 * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+	}
+
+	// Register and schedule the job
+	err := scheduler.RegisterJob(longRunningJob)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(longRunningJob)
+	require.NoError(t, err)
+
+	// Start the job
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
+
+	// Manually update the job to appear as if running on a different node
+	differentNodeID := uuid.New()
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET picked_by = $1 
+        WHERE name = $2 AND key = $3`,
+		scheduler.tableName)
+	_, err = testDB.Exec(query, differentNodeID, longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+
+	// Try to cancel the job
+	err = scheduler.CancelJob(longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
+
+	// Verify cancel_requested was done
+	var record JobRecord
+	query = fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	require.NoError(t, err)
+	assert.Equal(t, StatusFailed, record.Status)
+	assert.False(t, record.CancelRequested)
+	assert.False(t, record.Picked)
+}
+func TestHeartbeatMonitoring(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
+	require.NoError(t, err)
+
+	// Register and schedule the job
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(job)
+	require.NoError(t, err)
+
+	query := fmt.Sprintf(`SELECT heartbeat FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	var heartbeat time.Time
+	err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	require.NoError(t, err)
+	assert.Equal(t, epochStart, heartbeat.UTC())
+
+	// Start the job
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow job to start and update heartbeat
+
+	err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	require.NoError(t, err)
+	assert.True(t, heartbeat.After(epochStart))
+}
+
+func TestHeartbeatTimeout(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	defer cleanupTestDatabase(t, scheduler)
+
+	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
+	require.NoError(t, err)
+
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(job)
+	require.NoError(t, err)
+
+	// Manually mark the job as running with a stale heartbeat
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET picked = true, 
+            picked_by = $1, 
+            status = $2,
+            heartbeat = $3 
+        WHERE name = $4 AND key = $5`,
+		scheduler.tableName)
+
+	_, err = testDB.Exec(query,
+		scheduler.nodeID,
+		StatusRunning,
+		fakeClock.Now().UTC(),
+		job.Name(),
+		job.Key())
+	require.NoError(t, err)
+
+	// Advance clock beyond heartbeat timeout
+	fakeClock.Advance(scheduler.config.NoHeartbeatTimeout + time.Second)
+	time.Sleep(2 * time.Second) // Allow monitor to process
 
 	// Verify job was reset
-	query = fmt.Sprintf(`SELECT "picked", "status", "retries" FROM "%s"."%s" WHERE "key" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var job jobRecord
-	err = testDB.Get(&job, query, "test_job_key")
-	assert.NoError(t, err)
-	assert.False(t, job.Picked)
-	assert.Equal(t, statusPending, job.Status)
-	assert.Equal(t, 1, job.Retries)
-}
-
-func TestCalculateNextRun(t *testing.T) {
-	scheduler, _ := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	// Set the fake clock to a specific time
-	fakeNow := time.Date(2023, 5, 1, 10, 0, 0, 0, time.UTC)
-	scheduler.clock = clockwork.NewFakeClockAt(fakeNow)
-
-	// Test for immediate next minute
-	nextRun, err := scheduler.calculateNextRun("* * * * *")
-	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2023, 5, 1, 10, 1, 0, 0, time.UTC), nextRun)
-
-	// Test for next 5 minutes
-	nextRun, err = scheduler.calculateNextRun("*/5 * * * *")
-	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2023, 5, 1, 10, 5, 0, 0, time.UTC), nextRun)
-
-	// Test for specific time today
-	nextRun, err = scheduler.calculateNextRun("30 15 * * *")
-	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2023, 5, 1, 15, 30, 0, 0, time.UTC), nextRun)
-
-	// Test for specific time tomorrow
-	nextRun, err = scheduler.calculateNextRun("30 9 * * *")
-	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2023, 5, 2, 9, 30, 0, 0, time.UTC), nextRun)
-
-	_, err = scheduler.calculateNextRun("invalid cron")
-	assert.Error(t, err)
-}
-
-func TestNewRecurringJobConfig(t *testing.T) {
-	config, err := NewRecurringJobConfig("test_job", "*/5 * * * *")
-	assert.NoError(t, err)
-	assert.Equal(t, "test_job", config.Name())
-	assert.Equal(t, "*/5 * * * *", config.CronSchedule())
-	assert.Equal(t, JobTypeRecurring, config.JobType())
-}
-
-func TestNewOneTimeJobConfig(t *testing.T) {
-	params := map[string]string{"key": "value"}
-	config, err := NewOneTimeJobConfig("test_job", params, 5)
-	assert.NoError(t, err)
-	assert.Equal(t, "test_job", config.Name())
-	assert.Empty(t, config.CronSchedule())
-	assert.Equal(t, JobTypeOneTime, config.JobType())
-	assert.Equal(t, params, config.Parameters())
-	assert.Equal(t, 5, config.Retries())
-
-	_, err = NewOneTimeJobConfig("test_job", params, -1)
-	assert.Error(t, err)
-}
-
-func TestGetJobKey(t *testing.T) {
-	recurringJobConfig, err := NewRecurringJobConfig("recurring_job", "* * * * *")
+	var record JobRecord
+	query = fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&record, query, job.Name(), job.Key())
 	require.NoError(t, err)
-	recurringJob := &TestJob{JobConfig: *recurringJobConfig}
 
-	key, err := getJobKey(recurringJob)
-	assert.NoError(t, err)
-	assert.Equal(t, "recurring_job", key)
-
-	oneTimeJobConfig, err := NewOneTimeJobConfig("one_time_job", nil, 3)
-	require.NoError(t, err)
-	oneTimeJob := &TestJob{JobConfig: *oneTimeJobConfig}
-
-	key, err = getJobKey(oneTimeJob)
-	assert.NoError(t, err)
-	assert.Contains(t, key, "one_time_job#")
-	assert.Len(t, key, len("one_time_job")+1+36) // name + # + UUID
+	assert.False(t, record.Picked)
+	assert.Equal(t, StatusPending, record.Status)
 }
 
-func TestRunJob(t *testing.T) {
+func TestFailedAndCompletedJobCleanup(t *testing.T) {
 	scheduler, fakeClock := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
-	jobConfig, err := NewRecurringJobConfig("test_run_job", "* * * * *")
+	// Create and schedule a one-time job
+	job, err := NewTestOneTimeJob("cleanup_job", "key1", nil, 0)
 	require.NoError(t, err)
-	job := &TestJob{JobConfig: *jobConfig}
 
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
 	err = scheduler.ScheduleJob(job)
 	require.NoError(t, err)
 
-	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var jobRecord jobRecord
-	err = testDB.Get(&jobRecord, query, job.Name())
-	require.NoError(t, err)
-
-	scheduler.runJob(jobRecord.Key, job, jobRecord.Parameters, jobRecord.Retries)
-	fakeClock.Advance(10 * time.Second)
+	fakeClock.Advance(time.Minute)
 	time.Sleep(3 * time.Second)
-	// Verify job status after run
-	err = testDB.Get(&jobRecord, query, job.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, statusPending, jobRecord.Status)
-	assert.False(t, jobRecord.Picked)
-	assert.True(t, jobRecord.NextRun.After(fakeClock.Now().UTC()))
-	assert.True(t, jobRecord.ExecutionTime.Valid)
-	assert.Greater(t, jobRecord.ExecutionTime.Int64, int64(0))
-	assert.True(t, jobRecord.LastSuccess.Valid)
-}
-
-func TestMarkJobFailed(t *testing.T) {
-	scheduler, fakeClock := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	// Test recurring job
-	recurringJobConfig, err := NewRecurringJobConfig("test_recurring_job", "* * * * *")
-	require.NoError(t, err)
-	recurringJob := &TestJob{JobConfig: *recurringJobConfig}
-
-	err = scheduler.ScheduleJob(recurringJob)
-	require.NoError(t, err)
-
-	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var jobRecord jobRecord
-	err = testDB.Get(&jobRecord, query, recurringJob.Name())
-	require.NoError(t, err)
-
-	scheduler.markJobFailed(jobRecord.Key, recurringJob, 0, time.Second)
-
-	err = testDB.Get(&jobRecord, query, recurringJob.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, statusFailed, jobRecord.Status)
-	assert.True(t, jobRecord.ExecutionTime.Valid)
-	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64) // 1 second in milliseconds
-	assert.True(t, jobRecord.LastFailure.Valid)
-	assert.Equal(t,
-		fakeClock.Now().UTC().Truncate(time.Millisecond),
-		jobRecord.LastFailure.Time.UTC().Truncate(time.Millisecond))
-	assert.Equal(t, 1, jobRecord.ConsecutiveFailures)
-
-	// Test one-time job with retries
-	oneTimeJobConfig, err := NewOneTimeJobConfig("test_one_time_job", nil, 2)
-	require.NoError(t, err)
-	oneTimeJob := &TestJob{JobConfig: *oneTimeJobConfig}
-
-	err = scheduler.ScheduleJob(oneTimeJob)
-	require.NoError(t, err)
-
-	err = testDB.Get(&jobRecord, query, oneTimeJob.Name())
-	require.NoError(t, err)
-
-	scheduler.markJobFailed(jobRecord.Key, oneTimeJob, jobRecord.Retries, time.Second)
-
-	err = testDB.Get(&jobRecord, query, oneTimeJob.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, statusPending, jobRecord.Status)
-	assert.Equal(t, 1, jobRecord.Retries)
-	assert.True(t, jobRecord.ExecutionTime.Valid)
-	assert.Equal(t, int64(1000), jobRecord.ExecutionTime.Int64)
-	assert.True(t, jobRecord.LastFailure.Valid)
-	assert.Equal(t,
-		fakeClock.Now().UTC().Truncate(time.Millisecond),
-		jobRecord.LastFailure.Time.UTC().Truncate(time.Millisecond))
-	assert.Equal(t, 1, jobRecord.ConsecutiveFailures)
-}
-
-func TestRemoveJob(t *testing.T) {
-	scheduler, _ := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	jobConfig, err := NewOneTimeJobConfig("test_remove_job", nil, 0)
-	require.NoError(t, err)
-	job := &TestJob{JobConfig: *jobConfig}
-
-	err = scheduler.ScheduleJob(job)
-	require.NoError(t, err)
-
-	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var jobRecord jobRecord
-	err = testDB.Get(&jobRecord, query, job.Name())
-	require.NoError(t, err)
-
-	err = scheduler.removeJob(jobRecord.Key)
-	assert.NoError(t, err)
-
-	query = fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var count int
-	err = testDB.Get(&count, query, job.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, 0, count)
-}
-
-func TestUpdateHeartbeat(t *testing.T) {
-	scheduler, fakeClock := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	jobConfig, err := NewRecurringJobConfig("test_heartbeat_job", "* * * * *")
-	require.NoError(t, err)
-	job := &TestJob{JobConfig: *jobConfig}
-
-	err = scheduler.ScheduleJob(job)
-	require.NoError(t, err)
-	fakeClock.Advance(2 * time.Minute)
-
-	_, err = testDB.Exec(fmt.Sprintf(`UPDATE "%s"."%s" SET "picked_by" = $2 WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs"), job.Name(), scheduler.nodeID)
-	require.NoError(t, err)
-
-	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var jobRecord jobRecord
-	err = testDB.Get(&jobRecord, query, job.Name())
-	require.NoError(t, err)
-
-	stop := make(chan struct{})
-	go scheduler.updateHeartbeat(jobRecord.Key, stop)
-	time.Sleep(2 * time.Second) //wait for the ticker to register.
-
-	// Simulate time passing
-	fakeClock.Advance(1 * time.Second)
-	time.Sleep(time.Second) //yield just in case.
-	close(stop)
-
-	err = testDB.Get(&jobRecord, query, job.Name())
-	assert.NoError(t, err)
-	assert.True(t, jobRecord.Heartbeat.Valid)
-	assert.True(t, jobRecord.Heartbeat.Time.After(fakeClock.Now().UTC().Add(-3*time.Second)))
-}
-
-func TestShutdown(t *testing.T) {
-	scheduler, _ := setupTestScheduler(t, "public")
-	// Verify job registry is empty
-	defer func() {
-		jobRegistryRWLock.RLock()
-		assert.Len(t, jobRegistry, 0)
-		jobRegistryRWLock.RUnlock()
-	}()
-	defer cleanupTestDatabase(t, scheduler) //shutdown is in cleanup.
-
-	// Schedule a job to ensure there's something in the registry
-	jobConfig, err := NewRecurringJobConfig("test_shutdown_job", "* * * * *")
-	require.NoError(t, err)
-	job := &TestJob{JobConfig: *jobConfig}
-	err = scheduler.ScheduleJob(job)
-	require.NoError(t, err)
-
-	// Verify job is in the registry
-	jobRegistryRWLock.RLock()
-	assert.Len(t, jobRegistry, 1)
-	jobRegistryRWLock.RUnlock()
-}
-
-func TestFailedOneTimeJobCleaner(t *testing.T) {
-	scheduler, _ := setupTestScheduler(t, "public")
-	defer cleanupTestDatabase(t, scheduler)
-
-	// Add a failed one-time job
-	jobConfig, err := NewOneTimeJobConfig("test_failed_job", nil, 0)
-	require.NoError(t, err)
-	job := &TestJob{JobConfig: *jobConfig}
-
-	err = scheduler.ScheduleJob(job)
-	require.NoError(t, err)
 
 	// Mark the job as failed
-	query := fmt.Sprintf(`UPDATE "%s"."%s" SET "status" = $1 WHERE "name" = $2`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	_, err = testDB.Exec(query, statusFailed, job.Name())
+	query := fmt.Sprintf(`
+        UPDATE %s 
+        SET status = $1,
+            last_run = $2,
+            next_run = NULL
+        WHERE name = $3 AND key = $4`,
+		scheduler.tableName)
+
+	_, err = testDB.Exec(query,
+		StatusFailed,
+		fakeClock.Now().UTC(),
+		job.Name(),
+		job.Key())
 	require.NoError(t, err)
 
-	// Run the cleaner
-	err = scheduler.cleanFailedAndCompletedOneTimeJobs()
-	require.NoError(t, err)
+	fakeClock.Advance(scheduler.config.FailedAndCompletedJobCleanupInterval + time.Second)
+	time.Sleep(3 * time.Second) // Allow cleanup to process
 
-	// Verify the job was deleted
-	query = fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
+	// Verify job was cleaned up
 	var count int
-	err = testDB.Get(&count, query, job.Name())
-	assert.NoError(t, err)
+	query = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
+	err = testDB.Get(&count, query, job.Name(), job.Key())
+	require.NoError(t, err)
 	assert.Equal(t, 0, count)
 }
 
-func TestProcessJobs(t *testing.T) {
+func TestOrphanedJobCleanup(t *testing.T) {
 	scheduler, fakeClock := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
-	// Add a mix of recurring and one-time jobs
-	recurringJob, err := NewRecurringJobConfig("test_recurring_job", "* * * * *")
+	// Create an unregistered job directly in the database
+	query := fmt.Sprintf(`
+        INSERT INTO %s (name, key, heartbeat, picked, status, next_run)
+        VALUES ($1, $2, $3, false, $4, $5)`,
+		scheduler.tableName)
+
+	_, err := testDB.Exec(query,
+		"orphaned_job",
+		"orphaned_key",
+		epochStart,
+		StatusPending,
+		fakeClock.Now().UTC())
 	require.NoError(t, err)
-	err = scheduler.ScheduleJob(&TestJob{JobConfig: *recurringJob})
+
+	// Create and register a valid job
+	job, err := NewTestRecurringJobWithKey("valid_job", "key1", "* * * * *")
+	require.NoError(t, err)
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
+	err = scheduler.ScheduleJob(job)
 	require.NoError(t, err)
 
-	oneTimeJob, err := NewOneTimeJobConfig("test_one_time_job", nil, 1)
+	// Advance clock beyond orphaned timeout
+	fakeClock.Advance(scheduler.config.OrphanedJobTimeout + time.Second)
+	time.Sleep(2 * time.Second) // Allow cleanup to process
+
+	// Verify orphaned job was cleaned up but valid job remains
+	var count int
+	query = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1`, scheduler.tableName)
+
+	err = testDB.Get(&count, query, "orphaned_job")
 	require.NoError(t, err)
-	err = scheduler.ScheduleJob(&TestJob{JobConfig: *oneTimeJob})
+	assert.Equal(t, 0, count, "Orphaned job should be cleaned up")
+
+	err = testDB.Get(&count, query, "valid_job")
 	require.NoError(t, err)
-
-	// Register the jobs
-	jobRegistry[recurringJob.Name()] = &TestJob{JobConfig: *recurringJob}
-	jobRegistry[oneTimeJob.Name()] = &TestJob{JobConfig: *oneTimeJob}
-
-	// Advance clock to trigger jobs
-	fakeClock.Advance(time.Minute)
-
-	// Process jobs
-	err = scheduler.processJobs()
-	assert.NoError(t, err)
-
-	// Verify jobs were processed
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "picked" = true or last_success is not null`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	var pickedCount int
-	err = testDB.Get(&pickedCount, query)
-	assert.NoError(t, err)
-	assert.Equal(t, 2, pickedCount)
+	assert.Equal(t, 1, count, "Valid job should remain")
 }
 
-func TestOrphanedJobMonitor(t *testing.T) {
+func TestSchedulerShutdown(t *testing.T) {
 	scheduler, fakeClock := setupTestScheduler(t, "public")
+
+	// Create and register multiple jobs
+	for i := 0; i < 3; i++ {
+		job, err := NewTestRecurringJobWithKey(
+			fmt.Sprintf("job_%d", i),
+			fmt.Sprintf("key_%d", i),
+			"* * * * *",
+		)
+		require.NoError(t, err)
+		err = scheduler.RegisterJob(job)
+		require.NoError(t, err)
+		err = scheduler.ScheduleJob(job)
+		require.NoError(t, err)
+	}
+
+	// Start jobs
+	fakeClock.Advance(time.Minute)
+	time.Sleep(1 * time.Second) // Allow jobs to start
+
+	// Initiate shutdown
+	done := make(chan struct{})
+	go func() {
+		cleanupTestDatabase(t, scheduler)
+		close(done)
+	}()
+
+	// Wait for shutdown or timeout
+	select {
+	case <-done:
+		// Success
+	case <-time.After(10 * time.Second):
+		t.Fatal("Scheduler shutdown timed out")
+	}
+
+	// Verify all jobs are stopped
+	assert.Equal(t, int64(0), scheduler.getRunningJobsCount())
+
+	// Verify job registry is empty
+	scheduler.jobRegistryRWLock.RLock()
+	count := len(scheduler.jobRegistry)
+	scheduler.jobRegistryRWLock.RUnlock()
+	assert.Equal(t, 0, count)
+}
+
+func TestSchedulerMaxRunningJobs(t *testing.T) {
+	scheduler, fakeClock := setupTestScheduler(t, "public")
+	scheduler.config.MaxRunningJobs = 2 // Set low limit for testing
 	defer cleanupTestDatabase(t, scheduler)
 
-	// Override the OrphanedJobTimeout for testing
-	scheduler.config.OrphanedJobTimeout = 1 * time.Hour
+	// Create more jobs than the max limit
+	for i := 0; i < 4; i++ {
+		job := &TestJob{
+			name:       fmt.Sprintf("job_%d", i),
+			key:        fmt.Sprintf("key_%d", i),
+			maxRetries: 0,
+			runFunc: func(ctx context.Context) error {
+				time.Sleep(2 * time.Second) // Make jobs run long enough to test concurrency
+				return nil
+			},
+		}
 
-	// Create an orphaned job (not in the job registry)
-	orphanedJobKey := "orphaned_job"
+		err := scheduler.RegisterJob(job)
+		require.NoError(t, err)
+		err = scheduler.ScheduleJob(job)
+		require.NoError(t, err)
+	}
+
+	// Trigger job execution
+	fakeClock.Advance(time.Minute)
+	time.Sleep(1 * time.Second) // Allow initial jobs to start
+
+	// Verify only MaxRunningJobs are running
+	assert.Equal(t, int64(2), scheduler.getRunningJobsCount())
+
+	// Wait for first batch to complete and verify second batch starts
+	fakeClock.Advance(time.Minute)
+	time.Sleep(3 * time.Second)
+	assert.LessOrEqual(t, scheduler.getRunningJobsCount(), int64(2))
+
+	// Wait for all jobs to complete
+	fakeClock.Advance(time.Minute)
+	time.Sleep(3 * time.Second)
+	assert.Equal(t, int64(0), scheduler.getRunningJobsCount())
+
+	// Verify all jobs eventually completed
+	var completedCount int
 	query := fmt.Sprintf(`
-                INSERT INTO "%s"."%s" ("key", "name", "picked", "heartbeat", "job_type", "status", "next_run")
-                VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	_, err := testDB.Exec(query, orphanedJobKey, "orphaned_job", false, fakeClock.Now().UTC().Add(-2*time.Hour), JobTypeRecurring, statusPending, fakeClock.Now().UTC())
+        SELECT COUNT(*) 
+        FROM %s 
+        WHERE last_success IS NOT NULL`,
+		scheduler.tableName)
+
+	err := testDB.Get(&completedCount, query)
 	require.NoError(t, err)
-
-	// Create a non-orphaned job (in the job registry)
-	nonOrphanedJobConfig, err := NewRecurringJobConfig("non_orphaned_job", "* * * * *")
-	require.NoError(t, err)
-	nonOrphanedJob := &TestJob{JobConfig: *nonOrphanedJobConfig}
-	err = scheduler.ScheduleJob(nonOrphanedJob)
-	require.NoError(t, err)
-
-	// Register the non-orphaned job
-	jobRegistry[nonOrphanedJob.Name()] = nonOrphanedJob
-
-	// Advance clock to trigger orphaned job cleanup
-	fakeClock.Advance(2 * time.Hour)
-
-	// Run the orphaned job cleaner
-	err = scheduler.cleanOrphanedJobs()
-	assert.NoError(t, err)
-
-	// Verify the orphaned job was deleted
-	var orphanedJobCount int
-	query = fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "key" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	err = testDB.Get(&orphanedJobCount, query, orphanedJobKey)
-	assert.NoError(t, err)
-	assert.Equal(t, 0, orphanedJobCount, "Orphaned job should have been deleted")
-
-	// Verify the non-orphaned job still exists
-	var nonOrphanedJobCount int
-	query = fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s" WHERE "name" = $1`, scheduler.config.Schema, scheduler.config.TablePrefix+"scheduled_jobs")
-	err = testDB.Get(&nonOrphanedJobCount, query, nonOrphanedJob.Name())
-	assert.NoError(t, err)
-	assert.Equal(t, 1, nonOrphanedJobCount, "Non-orphaned job should still exist")
+	assert.Equal(t, 4, completedCount)
 }
