@@ -508,7 +508,7 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 		key:        "key1",
 		maxRetries: 0,
 		runFunc: func(ctx context.Context) error {
-			timer := time.NewTimer(10 * time.Second)
+			timer := time.NewTimer(15 * time.Second)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
