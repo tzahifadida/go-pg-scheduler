@@ -529,6 +529,8 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second)
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
 
 	// Manually update the job to appear as if running on a different node
 	differentNodeID := uuid.New()
