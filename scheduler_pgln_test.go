@@ -117,7 +117,7 @@ func TestPGLNJobReadyNotification(t *testing.T) {
 	err = testDB.Get(&record, query, job.Name(), job.Key())
 	require.NoError(t, err)
 	assert.False(t, record.Picked)
-	assert.Equal(t, StatusPending, record.Status)
+	assert.Equal(t, StatusCompleted, record.Status)
 }
 
 func TestPGLNCancelNotification(t *testing.T) {
@@ -241,5 +241,132 @@ func TestPGLNOutOfSync(t *testing.T) {
 	err = testDB.Get(&record, query, job.Name(), job.Key())
 	require.NoError(t, err)
 	assert.False(t, record.Picked)
-	assert.Equal(t, StatusPending, record.Status)
+	assert.Equal(t, StatusCompleted, record.Status)
+}
+
+func TestStatusChangeCallback(t *testing.T) {
+	// Create channels to track status changes and their order
+	statusChanges := make(chan struct {
+		name       string
+		key        string
+		prevStatus Status
+		newStatus  Status
+	}, 10)
+
+	jobProcessed := make(chan struct{})
+
+	testLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Create PGLN instance
+	builder := pgln.NewPGListenNotifyBuilder().
+		SetContext(context.Background()).
+		SetDB(testDBSQL).
+		SetReconnectInterval(time.Second)
+
+	pglnInstance, err := builder.Build()
+	require.NoError(t, err)
+	err = pglnInstance.Start()
+	require.NoError(t, err)
+
+	config := SchedulerConfig{
+		DB:                                   testDBSQL,
+		DBDriverName:                         "postgres",
+		MaxRunningJobs:                       10,
+		JobCheckInterval:                     100 * time.Second,
+		HeartbeatInterval:                    time.Second,
+		NoHeartbeatTimeout:                   3 * time.Second,
+		OrphanedJobTimeout:                   14 * 24 * time.Hour,
+		CreateSchema:                         true,
+		RunImmediately:                       false,
+		TablePrefix:                          "test_",
+		ShutdownTimeout:                      5 * time.Second,
+		Logger:                               testLogger,
+		FailedAndCompletedJobCleanupInterval: time.Hour,
+		CancelCheckPeriod:                    100 * time.Second,
+		Schema:                               "public",
+		Ctx:                                  context.Background(),
+		PGLNInstance:                         pglnInstance,
+		JobStatusChangeCallback: func(name, key string, prevStatus, newStatus Status) {
+			statusChanges <- struct {
+				name       string
+				key        string
+				prevStatus Status
+				newStatus  Status
+			}{name, key, prevStatus, newStatus}
+		},
+	}
+
+	scheduler, err := NewScheduler(config)
+	require.NoError(t, err)
+	require.NotNil(t, scheduler)
+	defer cleanupTestDatabaseWithPGLN(t, scheduler, pglnInstance)
+
+	err = scheduler.Init()
+	require.NoError(t, err)
+
+	err = scheduler.Start()
+	require.NoError(t, err)
+
+	// Create a test job that will succeed
+	job := &TestJob{
+		name:       "test_job",
+		key:        "key1",
+		maxRetries: 0,
+		runFunc: func(ctx context.Context) error {
+			close(jobProcessed)
+			return nil
+		},
+	}
+
+	err = scheduler.RegisterJob(job)
+	require.NoError(t, err)
+
+	// Schedule the job and collect status changes
+	err = scheduler.ScheduleJob(job)
+	require.NoError(t, err)
+
+	// We expect these status transitions:
+	// 1. "" -> "pending" (from scheduling)
+	// 2. "pending" -> "running" (from job start)
+	// 3. "running" -> "pending" (from job completion)
+
+	expectedTransitions := []struct {
+		prevStatus Status
+		newStatus  Status
+	}{
+		{"", StatusPending},
+		{StatusPending, StatusRunning},
+		{StatusRunning, StatusCompleted},
+	}
+
+	// Wait for job to complete
+	select {
+	case <-jobProcessed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Job did not complete in time")
+	}
+
+	// Give time for final status change to process
+	time.Sleep(time.Second)
+
+	// Verify all status transitions
+	for i, expected := range expectedTransitions {
+		select {
+		case change := <-statusChanges:
+			assert.Equal(t, job.Name(), change.name, "Unexpected job name in transition %d", i)
+			assert.Equal(t, job.Key(), change.key, "Unexpected job key in transition %d", i)
+			assert.Equal(t, expected.prevStatus, change.prevStatus, "Unexpected previous status in transition %d", i)
+			assert.Equal(t, expected.newStatus, change.newStatus, "Unexpected new status in transition %d", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Did not receive status change notification %d", i)
+		}
+	}
+
+	// Verify no additional status changes occurred
+	select {
+	case change := <-statusChanges:
+		t.Fatalf("Unexpected additional status change: %v -> %v", change.prevStatus, change.newStatus)
+	case <-time.After(time.Second):
+		// No additional changes, as expected
+	}
 }

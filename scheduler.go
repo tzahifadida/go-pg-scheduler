@@ -26,6 +26,8 @@ const (
 	ClusterSchedulerParametersKey = "ClusterSchedulerParametersKey"
 	scheduledJobsTableName        = "scheduled_jobs"
 	jobKeySeparator               = "@@"
+	notificationTypeStatusChange  = "status_change"
+	notificationTypeCancel        = "cancel"
 )
 
 type Status string
@@ -87,12 +89,19 @@ func (f *FixedInterval) NextRun(now time.Time) (time.Time, error) {
 	return now.Add(f.interval), nil
 }
 
-// Logger defines the interface for logging operations
 type Logger interface {
 	Debug(msg string, args ...any)
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 	Error(msg string, args ...any)
+}
+
+type statusChangeNotification struct {
+	Type       string `json:"type"`
+	Name       string `json:"name"`
+	Key        string `json:"key"`
+	Status     Status `json:"status"`
+	PrevStatus Status `json:"prev_status"`
 }
 
 // Job defines the interface for a schedulable job
@@ -104,7 +113,6 @@ type Job interface {
 	Parameters() interface{}
 	MaxRetries() int
 }
-
 type JobRecord struct {
 	Name                string          `db:"name"`
 	Key                 string          `db:"key"`
@@ -140,33 +148,40 @@ type SchedulerConfig struct {
 	ShutdownTimeout                      time.Duration
 	FailedAndCompletedJobCleanupInterval time.Duration
 	CancelCheckPeriod                    time.Duration
+	NotificationDebounceInterval         time.Duration
+	JobStatusChangeCallback              func(name, key string, prevStatus, newStatus Status)
 	Schema                               string
 	clock                                clockwork.Clock
 	PGLNInstance                         *pgln.PGListenNotify
 }
 
 type Scheduler struct {
-	initialized            bool
-	started                bool
-	config                 SchedulerConfig
-	db                     *sqlx.DB
-	nodeID                 uuid.UUID
-	shutdownChan           chan struct{}
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	tableName              string
-	runningJobsCount       int64
-	runningJobsMutex       sync.RWMutex
-	cancelFuncs            sync.Map
-	jobRegistry            map[string]Job
-	jobRegistryRWLock      sync.RWMutex
-	jobNames               []string
-	clock                  clockwork.Clock
-	notifyChannelJobReady  string // Added for PGLN
-	notifyChannelJobCancel string // Added for PGLN
+	initialized          bool
+	started              bool
+	config               SchedulerConfig
+	db                   *sqlx.DB
+	nodeID               uuid.UUID
+	shutdownChan         chan struct{}
+	wg                   sync.WaitGroup
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	tableName            string
+	runningJobsCount     int64
+	runningJobsMutex     sync.RWMutex
+	cancelFuncs          sync.Map
+	jobRegistry          map[string]Job
+	jobRegistryRWLock    sync.RWMutex
+	jobNames             []string
+	notificationChan     string
+	statusChangeCallback func(name, key string, prevStatus, newStatus Status)
+	clock                clockwork.Clock
+	lastProcessTime      time.Time
+	processMutex         sync.Mutex
+	hasEventsSinceCheck  bool
+	processWakeupCh      chan struct{}
+	debounceTimer        clockwork.Timer
+	debounceTimerRunning bool
 }
-
 type cancelTracker struct {
 	sync.RWMutex
 	cancelled map[string]bool
@@ -174,6 +189,27 @@ type cancelTracker struct {
 
 func getCancelKey(name, key string) string {
 	return name + jobKeySeparator + key
+}
+
+func (s *Scheduler) prepareStatusChangeNotification(name string, key string, prevStatus, newStatus Status) (*pgln.NotifyQueryResult, error) {
+	if s.config.PGLNInstance == nil {
+		return nil, nil
+	}
+
+	notification := statusChangeNotification{
+		Type:       notificationTypeStatusChange,
+		Name:       name,
+		Key:        key,
+		Status:     newStatus,
+		PrevStatus: prevStatus,
+	}
+
+	payload, err := json.Marshal(notification)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal notification: %w", err)
+	}
+	query := s.config.PGLNInstance.NotifyQuery(s.notificationChan, string(payload))
+	return &query, nil
 }
 func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	if config.DB == nil {
@@ -226,6 +262,10 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		config.CancelCheckPeriod = 30 * time.Second
 	}
 
+	if config.NotificationDebounceInterval == 0 {
+		config.NotificationDebounceInterval = 1 * time.Second
+	}
+
 	if config.Schema == "" {
 		config.Schema = "public"
 	}
@@ -243,82 +283,71 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		config:                 config,
-		db:                     sqlxDB,
-		nodeID:                 nodeID,
-		shutdownChan:           make(chan struct{}),
-		ctx:                    ctx,
-		cancel:                 cancel,
-		tableName:              fmt.Sprintf(`"%s"."%s"`, config.Schema, prefix+scheduledJobsTableName),
-		cancelFuncs:            sync.Map{},
-		jobRegistry:            make(map[string]Job),
-		clock:                  config.clock,
-		notifyChannelJobReady:  fmt.Sprintf("%s_job_ready", prefix),
-		notifyChannelJobCancel: fmt.Sprintf("%s_job_cancel", prefix),
+		config:               config,
+		db:                   sqlxDB,
+		nodeID:               nodeID,
+		shutdownChan:         make(chan struct{}),
+		ctx:                  ctx,
+		cancel:               cancel,
+		tableName:            fmt.Sprintf(`"%s"."%s"`, config.Schema, prefix+scheduledJobsTableName),
+		cancelFuncs:          sync.Map{},
+		jobRegistry:          make(map[string]Job),
+		notificationChan:     fmt.Sprintf("%s_job_notifications", prefix),
+		processWakeupCh:      make(chan struct{}, 1),
+		debounceTimer:        config.clock.NewTimer(config.NotificationDebounceInterval),
+		debounceTimerRunning: false,
+		statusChangeCallback: config.JobStatusChangeCallback,
+		clock:                config.clock,
 	}
+
+	// Stop timer initially since we don't have events yet
+	if !s.debounceTimer.Stop() {
+		select {
+		case <-s.debounceTimer.Chan():
+		default:
+		}
+	}
+
 	if config.PGLNInstance != nil {
 		if err := s.setupPGLN(); err != nil {
 			return nil, fmt.Errorf("failed to setup PGLN: %w", err)
 		}
 	}
+
 	return s, nil
 }
-func (s *Scheduler) setupPGLN() error {
-	// Setup listener for job ready notifications
-	err := s.config.PGLNInstance.ListenAndWaitForListening(s.notifyChannelJobReady, pgln.ListenOptions{
-		NotificationCallback: func(channel string, payload string) {
-			s.config.Logger.Debug("received job ready notification", "payload", payload)
-			go func() {
-				if err := s.processJobs(); err != nil {
-					s.config.Logger.Error("error processing jobs from notification", "error", err)
-				}
-			}()
-		},
-		ErrorCallback: func(channel string, err error) {
-			s.config.Logger.Error("job ready notification error", "error", err)
-		},
-		OutOfSyncBlockingCallback: func(channel string) error {
-			s.config.Logger.Info("job ready channel out of sync, checking for pending jobs", "channel", channel)
-			if err := s.processJobs(); err != nil {
-				return fmt.Errorf("error processing jobs during out of sync: %w", err)
-			}
-			return nil
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to setup job ready listener: %w", err)
-	}
 
-	// Setup listener for job cancellation notifications
-	err = s.config.PGLNInstance.ListenAndWaitForListening(s.notifyChannelJobCancel, pgln.ListenOptions{
+func (s *Scheduler) setupPGLN() error {
+	return s.config.PGLNInstance.ListenAndWaitForListening(s.notificationChan, pgln.ListenOptions{
 		NotificationCallback: func(channel string, payload string) {
-			var cancelInfo struct {
-				Name string `json:"name"`
-				Key  string `json:"key"`
-			}
-			if err := json.Unmarshal([]byte(payload), &cancelInfo); err != nil {
-				s.config.Logger.Error("failed to unmarshal cancel notification", "error", err)
+			var notification statusChangeNotification
+			if err := json.Unmarshal([]byte(payload), &notification); err != nil {
+				s.config.Logger.Error("failed to unmarshal notification", "error", err)
 				return
 			}
 
-			go func() {
-				s.checkForCancellations()
-			}()
+			switch notification.Type {
+			case notificationTypeCancel:
+				go s.checkForCancellations()
+			case notificationTypeStatusChange:
+				// Call the callback synchronously
+				if s.statusChangeCallback != nil {
+					s.statusChangeCallback(notification.Name, notification.Key,
+						notification.PrevStatus, notification.Status)
+				}
+
+				// Only the job processing check should be async
+				if notification.Status == StatusPending ||
+					notification.Status == StatusFailed ||
+					notification.Status == StatusCompleted {
+					s.checkForNewJobs()
+				}
+			}
 		},
 		ErrorCallback: func(channel string, err error) {
-			s.config.Logger.Error("job cancel notification error", "error", err)
-		},
-		OutOfSyncBlockingCallback: func(channel string) error {
-			s.config.Logger.Info("cancel channel out of sync, checking for pending cancellations", "channel", channel)
-			s.checkForCancellations()
-			return nil
+			s.config.Logger.Error("notification error", "error", err)
 		},
 	})
-	if err != nil {
-		return fmt.Errorf("failed to setup job cancel listener: %w", err)
-	}
-
-	return nil
 }
 func (s *Scheduler) Init() error {
 	if s.initialized {
@@ -439,7 +468,6 @@ func (s *Scheduler) Start() error {
 	go s.startCancelMonitor()
 
 	s.started = true
-
 	return nil
 }
 
@@ -519,7 +547,8 @@ func (s *Scheduler) ScheduleJob(job Job) error {
         DO UPDATE SET 
             next_run = $4,
             parameters = $5,
-            retries = $7
+            status = $6,    
+            retries = $7            
         WHERE NOT %s.picked
         RETURNING name`,
 		s.tableName, s.tableName)
@@ -541,28 +570,28 @@ func (s *Scheduler) ScheduleJob(job Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to schedule job: %w", err)
 	}
+	// Prepare status change notification for scheduled job
+	notifyQuery, err := s.prepareStatusChangeNotification(job.Name(), job.Key(), "", StatusPending)
+	if err != nil {
+		return fmt.Errorf("failed to prepare status change notification: %w", err)
+	}
 
-	// If PGLN is configured, add notification to transaction
-	if s.config.PGLNInstance != nil {
-		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notifyChannelJobReady, "new_job")
+	if notifyQuery != nil {
 		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
-			return fmt.Errorf("failed to add notification to transaction: %w", err)
+			return fmt.Errorf("failed to execute notification: %w", err)
 		}
 	}
 
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+	return tx.Commit()
 }
 
 func (s *Scheduler) startJobProcessing() {
 	defer s.wg.Done()
-	ticker := s.clock.NewTicker(s.config.JobCheckInterval)
-	defer ticker.Stop()
+
+	regularTicker := s.clock.NewTicker(s.config.JobCheckInterval)
+	defer regularTicker.Stop()
+	defer s.debounceTimer.Stop()
 
 	if s.config.RunImmediately {
 		if err := s.processJobs(); err != nil {
@@ -572,16 +601,76 @@ func (s *Scheduler) startJobProcessing() {
 
 	for {
 		select {
-		case <-ticker.Chan():
+		case <-s.shutdownChan:
+			return
+
+		case <-regularTicker.Chan():
+			// Regular interval check for missed notifications
 			if err := s.processJobs(); err != nil {
 				s.config.Logger.Error("error processing jobs", "error", err)
 			}
-		case <-s.shutdownChan:
-			return
+
+		case <-s.processWakeupCh:
+			// Received wake-up signal, ensure timer is running
+			s.processMutex.Lock()
+			if !s.debounceTimerRunning {
+				s.debounceTimer.Reset(s.config.NotificationDebounceInterval)
+				s.debounceTimerRunning = true
+			}
+			s.processMutex.Unlock()
+
+		case <-s.debounceTimer.Chan():
+			s.processMutex.Lock()
+			hasEvents := s.hasEventsSinceCheck
+			s.hasEventsSinceCheck = false
+
+			// Stop timer if no new events
+			if !hasEvents {
+				s.debounceTimerRunning = false
+				s.processMutex.Unlock()
+				continue
+			}
+
+			// Reset timer if we had events
+			s.debounceTimer.Reset(s.config.NotificationDebounceInterval)
+			s.processMutex.Unlock()
+
+			// Process jobs since we had events
+			if err := s.processJobs(); err != nil {
+				s.config.Logger.Error("error processing jobs", "error", err)
+			}
 		}
 	}
 }
 
+func (s *Scheduler) checkForNewJobs() {
+	s.processMutex.Lock()
+	defer s.processMutex.Unlock()
+
+	now := s.clock.Now()
+
+	// If we're still within debounce window, just mark that we have events
+	if now.Sub(s.lastProcessTime) < s.config.NotificationDebounceInterval {
+		s.hasEventsSinceCheck = true
+		return
+	}
+
+	s.lastProcessTime = now
+	s.hasEventsSinceCheck = true
+
+	// Start timer if it's not running
+	if !s.debounceTimerRunning {
+		s.debounceTimer.Reset(s.config.NotificationDebounceInterval)
+		s.debounceTimerRunning = true
+	}
+
+	// Wake up the monitor
+	select {
+	case s.processWakeupCh <- struct{}{}:
+	default:
+		// Channel already has a wake-up signal
+	}
+}
 func (s *Scheduler) processJobs() error {
 	runningCount := s.getRunningJobsCount()
 	if runningCount >= int64(s.config.MaxRunningJobs) {
@@ -685,10 +774,23 @@ func (s *Scheduler) acquireAndRunJobs(quota int) error {
 
 		s.incrementRunningJobs()
 		go s.runJob(jobToRun.name, jobToRun.key, job, jobToRun.parameters, jobToRun.retries)
+
+		notifyQuery, err := s.prepareStatusChangeNotification(jobToRun.name, jobToRun.key,
+			StatusPending, StatusRunning)
+		if err != nil {
+			return fmt.Errorf("failed to prepare status change notification: %w", err)
+		}
+		if notifyQuery != nil {
+			_, err = s.db.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+			if err != nil {
+				return fmt.Errorf("failed to execute notification: %w", err)
+			}
+		}
 	}
 
 	return nil
 }
+
 func (s *Scheduler) runJob(name string, key string, job Job, parameters json.RawMessage, retries int) {
 	defer s.decrementRunningJobs()
 
@@ -749,6 +851,13 @@ func (s *Scheduler) runJob(name string, key string, job Job, parameters json.Raw
 }
 
 func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.Duration) {
+	tx, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		s.config.Logger.Error("failed to begin transaction", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
 	parameters, err := json.Marshal(job.Parameters())
 	if err != nil {
 		s.config.Logger.Error("failed to marshal job parameters", "job", name, "error", err)
@@ -761,7 +870,7 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
         SELECT retries 
         FROM %s 
         WHERE name = $1 AND key = $2`, s.tableName)
-	err = s.db.QueryRow(query, name, key).Scan(&currentRetries)
+	err = tx.QueryRow(query, name, key).Scan(&currentRetries)
 	if err != nil {
 		s.config.Logger.Error("failed to get current retries", "job", name, "key", key, "error", err)
 		return
@@ -793,7 +902,6 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
 		status = StatusFailed
 		newRetries = 0
 	}
-
 	query = fmt.Sprintf(`
         UPDATE %s 
         SET picked = false, 
@@ -807,7 +915,7 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
             retries = $7
         WHERE name = $8 AND key = $9`, s.tableName)
 
-	_, err = s.db.Exec(query,
+	_, err = tx.Exec(query,
 		uuid.Nil,
 		nextRun,
 		status,
@@ -820,10 +928,37 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
 
 	if err != nil {
 		s.config.Logger.Error("failed to mark job as failed", "job", name, "error", err)
+		return
+	}
+
+	// Prepare and execute status change notification
+	notifyQuery, err := s.prepareStatusChangeNotification(name, key, StatusRunning, status)
+	if err != nil {
+		s.config.Logger.Error("failed to prepare status change notification", "error", err)
+		return
+	}
+
+	if notifyQuery != nil {
+		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		if err != nil {
+			s.config.Logger.Error("failed to execute notification", "error", err)
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 
 func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime time.Duration) {
+	tx, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		s.config.Logger.Error("failed to begin transaction", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
 	parameters, err := json.Marshal(job.Parameters())
 	if err != nil {
 		s.config.Logger.Error("failed to marshal job parameters", "job", name, "error", err)
@@ -841,7 +976,10 @@ func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime ti
 			return
 		}
 	}
-
+	newStatus := StatusCompleted
+	if nextRun != nil {
+		newStatus = StatusPending
+	}
 	query := fmt.Sprintf(`
         UPDATE %s 
         SET status = $1,
@@ -857,8 +995,8 @@ func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime ti
             retries = $8
         WHERE name = $9 AND key = $10`, s.tableName)
 
-	_, err = s.db.Exec(query,
-		StatusPending,
+	_, err = tx.Exec(query,
+		newStatus,
 		nowUTC,
 		uuid.Nil,
 		nextRun,
@@ -871,9 +1009,36 @@ func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime ti
 
 	if err != nil {
 		s.config.Logger.Error("failed to update job status", "job", name, "error", err)
+		return
+	}
+
+	// Prepare and execute status change notification
+	notifyQuery, err := s.prepareStatusChangeNotification(name, key, StatusRunning, newStatus)
+	if err != nil {
+		s.config.Logger.Error("failed to prepare status change notification", "error", err)
+		return
+	}
+
+	if notifyQuery != nil {
+		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		if err != nil {
+			s.config.Logger.Error("failed to execute notification", "error", err)
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 func (s *Scheduler) markJobCancelled(name, key string) {
+	tx, err := s.db.BeginTx(s.ctx, nil)
+	if err != nil {
+		s.config.Logger.Error("failed to begin transaction", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
 	nowUTC := s.clock.Now().UTC()
 	query := fmt.Sprintf(`
         UPDATE %s 
@@ -885,7 +1050,7 @@ func (s *Scheduler) markJobCancelled(name, key string) {
             cancel_requested = false
         WHERE name = $4 AND key = $5`, s.tableName)
 
-	_, err := s.db.Exec(query,
+	_, err = tx.Exec(query,
 		StatusFailed,
 		nowUTC,
 		uuid.Nil,
@@ -894,11 +1059,30 @@ func (s *Scheduler) markJobCancelled(name, key string) {
 
 	if err != nil {
 		s.config.Logger.Error("failed to mark job as cancelled", "job", name, "key", key, "error", err)
+		return
+	}
+
+	// Prepare and execute status change notification
+	notifyQuery, err := s.prepareStatusChangeNotification(name, key, StatusRunning, StatusFailed)
+	if err != nil {
+		s.config.Logger.Error("failed to prepare status change notification", "error", err)
+		return
+	}
+
+	if notifyQuery != nil {
+		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		if err != nil {
+			s.config.Logger.Error("failed to execute notification", "error", err)
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 
 func (s *Scheduler) CancelJob(name, key string) error {
-	// Start transaction
 	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -932,28 +1116,25 @@ func (s *Scheduler) CancelJob(name, key string) error {
 		return fmt.Errorf("failed to request job cancellation: %w", err)
 	}
 
-	// If PGLN is configured, add notification to transaction
-	if s.config.PGLNInstance != nil {
-		cancelInfo := struct {
-			Name string `json:"name"`
-			Key  string `json:"key"`
-		}{
-			Name: name,
-			Key:  key,
-		}
-		payload, err := json.Marshal(cancelInfo)
-		if err != nil {
-			return fmt.Errorf("failed to marshal cancel notification: %w", err)
-		}
+	// Prepare cancel notification
+	notification := statusChangeNotification{
+		Type: notificationTypeCancel,
+		Name: name,
+		Key:  key,
+	}
+	payload, err := json.Marshal(notification)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cancel notification: %w", err)
+	}
 
-		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notifyChannelJobCancel, string(payload))
+	if s.config.PGLNInstance != nil {
+		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notificationChan, string(payload))
 		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
-			return fmt.Errorf("failed to add notification to transaction: %w", err)
+			return fmt.Errorf("failed to execute notification: %w", err)
 		}
 	}
 
-	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -966,7 +1147,6 @@ func (s *Scheduler) CancelJob(name, key string) error {
 
 	return nil
 }
-
 func (s *Scheduler) startCancelMonitor() {
 	defer s.wg.Done()
 	ticker := s.clock.NewTicker(s.config.CancelCheckPeriod)
@@ -1056,20 +1236,20 @@ func (s *Scheduler) startHeartbeatMonitor() {
 
 func (s *Scheduler) checkAndResetTimedOutJobs() error {
 	query := fmt.Sprintf(`
-        UPDATE %s
-        SET picked = false, 
-            picked_by = $1, 
-            next_run = $2,
-            status = $3
-        WHERE picked = true 
-        AND heartbeat < $4
-        RETURNING name, key`, s.tableName)
+        WITH timed_out_jobs AS (
+            UPDATE %s
+            SET picked = false, 
+                picked_by = $1, 
+                next_run = $2,
+                status = $3
+            WHERE picked = true 
+            AND heartbeat < $4
+            RETURNING name, key, status as prev_status
+        )
+        SELECT name, key, prev_status FROM timed_out_jobs`,
+		s.tableName)
 
-	var jobs []struct {
-		Name string
-		Key  string
-	}
-	err := s.db.Select(&jobs, query,
+	rows, err := s.db.Query(query,
 		uuid.Nil,
 		s.clock.Now().UTC(),
 		StatusPending,
@@ -1078,14 +1258,36 @@ func (s *Scheduler) checkAndResetTimedOutJobs() error {
 	if err != nil {
 		return fmt.Errorf("failed to reset timed-out jobs: %w", err)
 	}
+	defer rows.Close()
 
-	for _, job := range jobs {
+	// Process each timed out job and send notifications
+	for rows.Next() {
+		var job struct {
+			Name       string
+			Key        string
+			PrevStatus Status
+		}
+		if err := rows.Scan(&job.Name, &job.Key, &job.PrevStatus); err != nil {
+			return fmt.Errorf("failed to scan timed-out job: %w", err)
+		}
+
+		notifyQuery, err := s.prepareStatusChangeNotification(job.Name, job.Key, job.PrevStatus, StatusPending)
+		if err != nil {
+			return fmt.Errorf("failed to prepare status change notification: %w", err)
+		}
+
+		if notifyQuery != nil {
+			_, err = s.db.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+			if err != nil {
+				return fmt.Errorf("failed to execute notification: %w", err)
+			}
+		}
+
 		s.config.Logger.Debug("reset timed-out job", "job", job.Name, "key", job.Key)
 	}
 
 	return nil
 }
-
 func (s *Scheduler) startFailedAndCompletedJobCleaner() {
 	defer s.wg.Done()
 	ticker := s.clock.NewTicker(s.config.FailedAndCompletedJobCleanupInterval)
@@ -1105,9 +1307,9 @@ func (s *Scheduler) startFailedAndCompletedJobCleaner() {
 
 func (s *Scheduler) cleanFailedAndCompletedJobs() error {
 	query := fmt.Sprintf(`
-        DELETE FROM %s 
-        WHERE next_run IS NULL 
-        AND status IN ($1, $2) 
+            DELETE FROM %s 
+            WHERE next_run IS NULL 
+            AND status IN ($1, $2) 
         AND last_run < $3`,
 		s.tableName)
 
@@ -1152,8 +1354,8 @@ func (s *Scheduler) cleanOrphanedJobs() error {
 	}
 
 	query := fmt.Sprintf(`
-        DELETE FROM %s
-        WHERE name NOT IN (?)
+            DELETE FROM %s
+            WHERE name NOT IN (?)
         AND heartbeat < ?`, s.tableName)
 
 	query, args, err := sqlx.In(query, jobNames, s.clock.Now().UTC().Add(-s.config.OrphanedJobTimeout))

@@ -33,6 +33,27 @@ PGScheduler optionally integrates with PGLN (PostgreSQL Listen/Notify) to provid
 - Automatic recovery of missed events during disconnections
 - Transactional notifications ensure consistency
 
+### Status Change Callbacks
+
+When PGLN is configured, PGScheduler can notify your application about job status changes immediately through callbacks. This helps reduce polling overhead by enabling reactive behavior:
+
+```go
+config := pgscheduler.SchedulerConfig{
+    // ... other configuration
+    PGLNInstance: pglnInstance, // Required for status callbacks
+    JobStatusChangeCallback: func(name, key string, prevStatus, newStatus Status) {
+        // React to status changes immediately instead of waiting for next poll
+        if newStatus == StatusCompleted {
+            triggerNextAction()
+        }
+    },
+}
+```
+
+**Note:** Since PGLN can disconnect and miss events, implement fallback polling for critical operations.
+
+Status transitions: `"" -> "pending"` (scheduled), `"pending" -> "running"` (started), `"running" -> "pending/failed/completed"` (finished).
+
 ## Installation
 
 To install PGScheduler, use `go get`:
@@ -104,7 +125,8 @@ type SchedulerConfig struct {
     FailedAndCompletedJobCleanupInterval time.Duration
     CancelCheckPeriod                    time.Duration
     Schema                               string
-    PGLNInstance                         *pgln.PGListenNotify // Optional PGLN instance
+    JobStatusChangeCallback              func(name, key string, prevStatus, newStatus Status)
+    PGLNInstance                         *pgln.PGListenNotify // Required for status callbacks
 }
 ```
 
@@ -230,14 +252,15 @@ scheduler.ScheduleJob(job)
 
 ## Best Practices
 
-1. Always call `scheduler.Shutdown()` when your application is terminating.
-2. Use unique job keys for different instances of the same job type.
-3. Consider using PGLN integration for time-sensitive operations.
-4. Keep job execution times reasonable.
-5. Use appropriate retry counts and intervals.
-6. Implement proper error handling in your job's `Run` method.
-7. Use the context passed to the `Run` method for cancellation.
-8. Consider your PostgreSQL connection pool size when setting MaxRunningJobs.
+1. Always call `scheduler.Shutdown()` when your application is terminating
+2. Use unique job keys for different instances of the same job type
+3. Consider using PGLN integration for time-sensitive operations
+4. Keep job execution times reasonable
+5. Use appropriate retry counts and intervals
+6. Implement proper error handling in your job's `Run` method
+7. Use the context passed to the `Run` method for cancellation
+8. Consider your PostgreSQL connection pool size when setting MaxRunningJobs
+9. Implement fallback polling for critical operations when using status callbacks
 
 ## Contributing
 
