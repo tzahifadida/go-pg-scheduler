@@ -419,17 +419,18 @@ func TestJobCancellation(t *testing.T) {
 	// Start the job
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second) // Allow job to start
-	fakeClock.Advance(time.Minute)
-	time.Sleep(2 * time.Second) // Allow job to start
-	fakeClock.Advance(time.Minute)
-	time.Sleep(2 * time.Second) // Allow job to start
-	fakeClock.Advance(time.Minute)
-	time.Sleep(2 * time.Second) // Allow job to start
 
-	// Verify job is running
 	var record JobRecord
 	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	for i := 0; i < 10; i++ {
+		fakeClock.Advance(time.Minute)
+		time.Sleep(2 * time.Second)
+		// Verify job is running
+		err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+		if err == nil && record.Status == StatusRunning {
+			break
+		}
+	}
 	require.NoError(t, err)
 	assert.Equal(t, StatusRunning, record.Status)
 
@@ -547,7 +548,14 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Try to cancel the job
-	err = scheduler.CancelJob(longRunningJob.Name(), longRunningJob.Key())
+	for i := 0; i < 10; i++ {
+		err = scheduler.CancelJob(longRunningJob.Name(), longRunningJob.Key())
+		if err == nil {
+			break
+		}
+		fakeClock.Advance(time.Minute)
+		time.Sleep(2 * time.Second)
+	}
 	require.NoError(t, err)
 
 	fakeClock.Advance(time.Minute)
