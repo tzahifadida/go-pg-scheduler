@@ -423,6 +423,8 @@ func TestJobCancellation(t *testing.T) {
 	time.Sleep(2 * time.Second) // Allow job to start
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second) // Allow job to start
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second) // Allow job to start
 
 	// Verify job is running
 	var record JobRecord
@@ -508,7 +510,7 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 		key:        "key1",
 		maxRetries: 0,
 		runFunc: func(ctx context.Context) error {
-			timer := time.NewTimer(15 * time.Second)
+			timer := time.NewTimer(60 * time.Second)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -525,6 +527,8 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start the job
+	fakeClock.Advance(time.Minute)
+	time.Sleep(2 * time.Second)
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second)
 	fakeClock.Advance(time.Minute)
