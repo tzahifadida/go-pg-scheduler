@@ -690,15 +690,17 @@ func (s *Scheduler) processJobs() error {
 }
 
 func (s *Scheduler) acquireAndRunJobs(quota int) error {
+	s.jobRegistryRWLock.RLock()
+	jobNames := s.jobNames
+	s.jobRegistryRWLock.RUnlock()
+	if len(jobNames) == 0 {
+		return nil
+	}
 	tx, err := s.db.Beginx()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
-
-	s.jobRegistryRWLock.RLock()
-	jobNames := s.jobNames
-	s.jobRegistryRWLock.RUnlock()
 
 	query := fmt.Sprintf(`
         WITH available_jobs AS (
