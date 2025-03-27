@@ -1226,11 +1226,20 @@ func (s *Scheduler) updateHeartbeat(name, key string, stop chan struct{}) {
 
 func (s *Scheduler) startHeartbeatMonitor() {
 	defer s.wg.Done()
+
+	// wait for 10 seconds to prevent load shocks
+	initialTimer := s.clock.NewTimer(10 * time.Second)
+	defer initialTimer.Stop()
+
 	ticker := s.clock.NewTicker(s.config.NoHeartbeatTimeout)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-initialTimer.Chan():
+			if err := s.checkAndResetTimedOutJobs(); err != nil {
+				s.config.Logger.Error("error checking and resetting timed out jobs for first run", "error", err)
+			}
 		case <-ticker.Chan():
 			if err := s.checkAndResetTimedOutJobs(); err != nil {
 				s.config.Logger.Error("error checking and resetting timed out jobs", "error", err)
