@@ -545,13 +545,18 @@ func (s *Scheduler) ScheduleJob(job Job) error {
         VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8)
         ON CONFLICT ("name", "key") 
         DO UPDATE SET 
-            next_run = $4,
-            parameters = $5,
-            status = $6,    
-            retries = $7            
+            next_run = 
+                CASE 
+                    WHEN %s.next_run IS NULL OR excluded.next_run < %s.next_run 
+                    THEN excluded.next_run 
+                    ELSE %s.next_run
+                END,
+            parameters = excluded.parameters,
+            status = excluded.status,    
+            retries = excluded.retries            
         WHERE NOT %s.picked
         RETURNING name`,
-		s.tableName, s.tableName)
+		s.tableName, s.tableName, s.tableName, s.tableName, s.tableName)
 
 	var returnedName string
 	err = tx.QueryRow(query,
